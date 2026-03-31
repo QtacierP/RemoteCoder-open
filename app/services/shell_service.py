@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import json
+import shlex
 import shutil
 import signal
 import subprocess
@@ -12,6 +14,45 @@ from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from app.db import Database
+
+
+class _PidProcessHandle:
+    def __init__(self, pid: int, return_code: int | None = None) -> None:
+        self.pid = pid
+        self._return_code = return_code
+
+    def poll(self) -> int | None:
+        if self._return_code is not None:
+            return self._return_code
+        stat_path = Path(f"/proc/{self.pid}/stat")
+        if stat_path.exists():
+            try:
+                fields = stat_path.read_text(encoding="utf-8", errors="replace").split()
+            except OSError:
+                fields = []
+            if len(fields) >= 3 and fields[2] == "Z":
+                self._return_code = -1
+                return self._return_code
+        try:
+            os.kill(self.pid, 0)
+        except ProcessLookupError:
+            self._return_code = self._return_code if self._return_code is not None else -1
+            return self._return_code
+        except PermissionError:
+            return None
+        return None
+
+    def wait(self, timeout: float | None = None) -> int | None:
+        deadline = None if timeout is None else (time.time() + timeout)
+        while True:
+            result = self.poll()
+            if result is not None:
+                return result
+            if deadline is not None and time.time() >= deadline:
+                raise subprocess.TimeoutExpired(cmd=f"pid:{self.pid}", timeout=timeout)
+            time.sleep(0.1)
+
 
 @dataclass
 class _JobState:
@@ -20,7 +61,7 @@ class _JobState:
     command: str
     cwd: Path
     log_path: Path
-    process: subprocess.Popen[str]
+    process: subprocess.Popen[str] | _PidProcessHandle
     started_at: float
     notified_done: bool = False
 
@@ -28,6 +69,7 @@ class _JobState:
 @dataclass
 class _ShellState:
     cwd: Path
+    conda_env: str | None = None
     busy: bool = False
     last_exit_code: int | None = None
     lock: threading.Lock = field(default_factory=threading.Lock)
@@ -36,18 +78,114 @@ class _ShellState:
 
 
 class ShellService:
+    WATCH_KEYWORDS = (
+        "loss",
+        "epoch",
+        "step",
+        "lr",
+        "acc",
+        "accuracy",
+        "val",
+        "eval",
+        "checkpoint",
+        "save",
+        "eta",
+        "it/s",
+        "iter",
+        "train",
+        "testing",
+    )
+
     def __init__(
         self,
         default_workspace: Path,
         timeout_seconds: int = 60,
         log_root: str | Path | None = None,
+        db: Database | None = None,
     ) -> None:
         self.default_workspace = default_workspace.resolve()
         self.timeout_seconds = timeout_seconds
         self.log_root = Path(log_root or "/tmp/remotecoder_shell_jobs").resolve()
         self.log_root.mkdir(parents=True, exist_ok=True)
+        self.db = db
         self._sessions: dict[int, _ShellState] = {}
         self._lock = threading.Lock()
+
+    def _persist_shell_state(self, chat_id: int, state: _ShellState) -> None:
+        if self.db is None:
+            return
+        self.db.upsert_shell_session(
+            chat_id=chat_id,
+            cwd=str(state.cwd),
+            conda_env=state.conda_env,
+            last_exit_code=state.last_exit_code,
+        )
+
+    def _persist_job_state(self, chat_id: int, job: _JobState) -> None:
+        if self.db is None:
+            return
+        self.db.upsert_shell_job(
+            chat_id=chat_id,
+            job_id=job.job_id,
+            label=job.label,
+            command=job.command,
+            cwd=str(job.cwd),
+            log_path=str(job.log_path),
+            pid=job.process.pid,
+            started_at=job.started_at,
+            notified_done=job.notified_done,
+            return_code=job.process.poll(),
+        )
+
+    def _delete_shell_jobs(self, chat_id: int) -> None:
+        if self.db is None:
+            return
+        self.db.delete_shell_jobs(chat_id)
+
+    def restore_persisted_state(self) -> list[dict]:
+        if self.db is None:
+            return []
+
+        sessions = {item["chat_id"]: item for item in self.db.list_shell_sessions()}
+        jobs_by_chat: dict[int, list[dict]] = {}
+        for job in self.db.list_shell_jobs():
+            jobs_by_chat.setdefault(job["chat_id"], []).append(job)
+
+        restored: list[dict] = []
+        with self._lock:
+            for chat_id, session in sessions.items():
+                state = _ShellState(
+                    cwd=Path(session["cwd"]).resolve(),
+                    conda_env=session.get("conda_env"),
+                    last_exit_code=session.get("last_exit_code"),
+                )
+                for job_record in sorted(jobs_by_chat.get(chat_id, []), key=lambda item: item["job_id"]):
+                    handle = _PidProcessHandle(
+                        pid=int(job_record["pid"]),
+                        return_code=job_record.get("return_code"),
+                    )
+                    job = _JobState(
+                        job_id=int(job_record["job_id"]),
+                        label=job_record.get("label", ""),
+                        command=job_record["command"],
+                        cwd=Path(job_record["cwd"]).resolve(),
+                        log_path=Path(job_record["log_path"]).resolve(),
+                        process=handle,
+                        started_at=float(job_record["started_at"]),
+                        notified_done=bool(job_record.get("notified_done")),
+                    )
+                    state.jobs[job.job_id] = job
+                if state.jobs:
+                    state.next_job_id = max(state.jobs) + 1
+                self._sessions[chat_id] = state
+                restored.append(
+                    {
+                        "chat_id": chat_id,
+                        "cwd": str(state.cwd),
+                        "jobs": len(state.jobs),
+                    }
+                )
+        return restored
 
     def _resolve_workspace_path(self, workspace: str | Path, requested_path: str | Path | None = None) -> Path:
         root = Path(workspace).resolve()
@@ -78,7 +216,47 @@ class ShellService:
             if state is None:
                 state = _ShellState(cwd=target)
                 self._sessions[chat_id] = state
+                self._persist_shell_state(chat_id, state)
             return state
+
+    @staticmethod
+    def _build_shell_script(
+        command: str,
+        conda_env: str | None = None,
+        cwd_marker: str | None = None,
+        force_unbuffered: bool = False,
+    ) -> str:
+        lines = ['source "$HOME/.bashrc" >/dev/null 2>&1 || true']
+        if force_unbuffered:
+            lines.extend(
+                [
+                    "export PYTHONUNBUFFERED=1",
+                    "export PYTHONIOENCODING=UTF-8",
+                ]
+            )
+        if conda_env:
+            quoted_env = shlex.quote(conda_env)
+            lines.extend(
+                [
+                    'if command -v conda >/dev/null 2>&1; then',
+                    '  eval "$(conda shell.bash hook)"',
+                    "else",
+                    "  echo 'conda command not found' >&2",
+                    "  exit 127",
+                    "fi",
+                    f"conda activate {quoted_env}",
+                ]
+            )
+        lines.append(command)
+        if cwd_marker:
+            lines.append(f'printf \'\\n{cwd_marker}%s\\n\' "$PWD"')
+        return "\n".join(lines)
+
+    @staticmethod
+    def _build_background_command(shell_script: str) -> list[str]:
+        if shutil.which("stdbuf"):
+            return ["stdbuf", "-oL", "-eL", "bash", "-lc", shell_script]
+        return ["bash", "-lc", shell_script]
 
     def execute(self, chat_id: int, command: str, workspace: str | Path | None = None) -> str:
         state = self._get_or_create(chat_id, workspace)
@@ -86,7 +264,7 @@ class ShellService:
             state.busy = True
             try:
                 marker = "__RC_CWD__="
-                shell_script = f"{command}\nprintf '\\n{marker}%s\\n' \"$PWD\""
+                shell_script = self._build_shell_script(command, state.conda_env, marker)
                 proc = subprocess.run(
                     ["bash", "-lc", shell_script],
                     cwd=state.cwd,
@@ -107,6 +285,7 @@ class ShellService:
                         continue
                     cleaned_lines.append(line)
                 state.cwd = new_cwd
+                self._persist_shell_state(chat_id, state)
                 output = "\n".join(cleaned_lines).strip()
                 if output:
                     return output
@@ -158,12 +337,15 @@ class ShellService:
             with log_path.open("w", encoding="utf-8") as log_file:
                 if label.strip():
                     log_file.write(f"[label] {label.strip()}\n")
+                if state.conda_env:
+                    log_file.write(f"[conda_env] {state.conda_env}\n")
                 log_file.write(f"$ {command}\n")
                 log_file.write(f"[cwd] {state.cwd}\n")
                 log_file.write(f"[started_at] {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}\n\n")
                 log_file.flush()
+                shell_script = self._build_shell_script(command, state.conda_env, force_unbuffered=True)
                 process = subprocess.Popen(
-                    ["bash", "-lc", command],
+                    self._build_background_command(shell_script),
                     cwd=state.cwd,
                     stdout=log_file,
                     stderr=subprocess.STDOUT,
@@ -180,6 +362,8 @@ class ShellService:
                 started_at=time.time(),
             )
             state.jobs[job_id] = job
+            self._persist_shell_state(chat_id, state)
+            self._persist_job_state(chat_id, job)
             return self._job_snapshot(job)
 
     def _job_snapshot(self, job: _JobState) -> dict:
@@ -209,6 +393,7 @@ class ShellService:
                 "exists": False,
                 "workspace": str(self.default_workspace),
                 "cwd": str(self.default_workspace),
+                "conda_env": "(default)",
                 "busy": False,
                 "last_exit_code": None,
                 "jobs": [],
@@ -223,6 +408,7 @@ class ShellService:
                 "exists": True,
                 "workspace": str(self.default_workspace),
                 "cwd": str(state.cwd),
+                "conda_env": state.conda_env or "(default)",
                 "busy": state.busy,
                 "last_exit_code": state.last_exit_code,
                 "jobs": jobs,
@@ -286,6 +472,41 @@ class ShellService:
                 "output": "\n".join(tail).strip(),
             }
 
+    def watch_logs(self, chat_id: int, job_id: int | None = None, lines: int = 20, keywords: list[str] | None = None) -> dict:
+        lines = max(1, min(lines, 400))
+        with self._lock:
+            state = self._sessions.get(chat_id)
+        if state is None:
+            return {"ok": False, "error": "No shell session for this chat yet."}
+        with state.lock:
+            if job_id is None:
+                job = self._latest_job(state)
+            else:
+                job = state.jobs.get(job_id)
+            if job is None:
+                return {"ok": False, "error": "No matching shell job found."}
+            snapshot = self._job_snapshot(job)
+            text = ""
+            if job.log_path.exists():
+                text = job.log_path.read_text(encoding="utf-8", errors="replace")
+            all_lines = text.splitlines()
+            active_keywords = [item.strip().lower() for item in (keywords or self.WATCH_KEYWORDS) if item and item.strip()]
+            matched = [
+                line
+                for line in all_lines
+                if any(keyword in line.lower() for keyword in active_keywords)
+            ]
+            tail = matched[-lines:]
+            return {
+                "ok": True,
+                "job": snapshot,
+                "line_count": len(all_lines),
+                "matched_count": len(matched),
+                "shown_lines": len(tail),
+                "keywords": active_keywords,
+                "output": "\n".join(tail).strip(),
+            }
+
     def stop_job(self, chat_id: int, job_id: int, force: bool = False) -> dict:
         with self._lock:
             state = self._sessions.get(chat_id)
@@ -297,6 +518,7 @@ class ShellService:
                 return {"ok": False, "error": f"No shell job #{job_id} found."}
             if job.process.poll() is not None:
                 snapshot = self._job_snapshot(job)
+                self._persist_job_state(chat_id, job)
                 return {"ok": True, "job": snapshot, "already_stopped": True}
 
             sig = signal.SIGKILL if force else signal.SIGTERM
@@ -315,6 +537,10 @@ class ShellService:
         snapshot = self.get_job(chat_id, job_id)
         if snapshot is None:
             return {"ok": False, "error": f"No shell job #{job_id} found after stop attempt."}
+        with state.lock:
+            current_job = state.jobs.get(job_id)
+            if current_job is not None:
+                self._persist_job_state(chat_id, current_job)
         return {"ok": True, "job": snapshot, "already_stopped": False}
 
     def stop_all_jobs(self, chat_id: int, force: bool = False) -> dict:
@@ -351,6 +577,7 @@ class ShellService:
                     if job.process.poll() is None:
                         continue
                     job.notified_done = True
+                    self._persist_job_state(chat_id, job)
                     snapshot = self._job_snapshot(job)
                     text = ""
                     if job.log_path.exists():
@@ -738,6 +965,7 @@ class ShellService:
             f"shell_exists: {status['exists']}",
             f"shell_busy: {status['busy']}",
             f"shell_cwd: {status['cwd']}",
+            f"conda_env: {status.get('conda_env', '(default)')}",
             f"shell_last_exit_code: {status['last_exit_code']}",
             f"active_jobs: {len(status['active_job_ids'])}",
             f"latest_job_id: {status['latest_job_id']}",
@@ -769,16 +997,74 @@ class ShellService:
                         if job.process.poll() is None:
                             with suppress(ProcessLookupError):
                                 os.killpg(job.process.pid, signal.SIGTERM)
-            self._sessions[chat_id] = _ShellState(cwd=target)
+            conda_env = old_state.conda_env if old_state is not None else None
+            self._sessions[chat_id] = _ShellState(cwd=target, conda_env=conda_env)
+            self._persist_shell_state(chat_id, self._sessions[chat_id])
+            self._delete_shell_jobs(chat_id)
         return self.get_status(chat_id)
+
+    def list_conda_envs(self) -> list[dict[str, str]]:
+        proc = subprocess.run(
+            [
+                "bash",
+                "-lc",
+                'source "$HOME/.bashrc" >/dev/null 2>&1 || true; conda info --envs --json',
+            ],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout or "unknown error").strip()
+            raise RuntimeError(f"Failed to list conda envs: {detail}")
+        data = json.loads(proc.stdout or "{}")
+        active_prefix = data.get("active_prefix", "")
+        envs: list[dict[str, str]] = []
+        for prefix in data.get("envs", []):
+            path = Path(prefix)
+            name = "base" if path == Path(data.get("root_prefix", "")) else path.name
+            envs.append(
+                {
+                    "name": name,
+                    "path": str(path),
+                    "active": "true" if str(path) == active_prefix else "false",
+                }
+            )
+        return envs
+
+    def set_conda_env(self, chat_id: int, env_name: str) -> dict[str, str]:
+        requested = env_name.strip()
+        if not requested:
+            raise ValueError("Usage: /conda <env>")
+        envs = self.list_conda_envs()
+        match = next((env for env in envs if env["name"] == requested or env["path"] == requested), None)
+        if match is None:
+            available = ", ".join(env["name"] for env in envs)
+            raise ValueError(f"Unknown conda env '{requested}'. Available: {available}")
+        state = self._get_or_create(chat_id)
+        with state.lock:
+            state.conda_env = match["name"]
+            self._persist_shell_state(chat_id, state)
+            return {"conda_env": state.conda_env, "path": match["path"]}
+
+    def clear_conda_env(self, chat_id: int) -> dict[str, str]:
+        state = self._get_or_create(chat_id)
+        with state.lock:
+            previous = state.conda_env or "(default)"
+            state.conda_env = None
+            self._persist_shell_state(chat_id, state)
+            return {"previous": previous, "conda_env": "(default)"}
 
     def close_all(self) -> None:
         with self._lock:
-            sessions = list(self._sessions.values())
+            sessions = list(self._sessions.items())
             self._sessions.clear()
-        for state in sessions:
+        for chat_id, state in sessions:
             with state.lock:
                 for job in state.jobs.values():
                     if job.process.poll() is None:
                         with suppress(ProcessLookupError):
                             os.killpg(job.process.pid, signal.SIGTERM)
+                    self._persist_job_state(chat_id, job)
+                self._persist_shell_state(chat_id, state)

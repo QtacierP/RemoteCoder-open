@@ -11,6 +11,7 @@ from pathlib import Path
 from fastapi import FastAPI
 
 from app.adapters.telegram import TelegramAdapter
+from app.codex.base import CodexReplyCancelled
 from app.api.routes import router
 from app.codex.cli_session import CodexCliSessionBackend
 from app.codex.sdk_mode import CodexSdkBackend
@@ -48,6 +49,7 @@ def build_app() -> FastAPI:
             timeout_seconds=settings.codex_message_timeout_seconds,
             proxy_url=settings.shared_effective_proxy_url,
             debug_mode=settings.codex_debug_mode,
+            web_search_enabled=settings.codex_web_search_enabled,
         ),
         "codex_sdk": CodexSdkBackend(),
     }
@@ -60,7 +62,11 @@ def build_app() -> FastAPI:
         default_mode=settings.default_codex_mode,
     )
     conversation_history = ConversationHistoryService(settings.conversation_history_dir)
-    shell_service = ShellService(settings.default_workspace, timeout_seconds=settings.codex_message_timeout_seconds)
+    shell_service = ShellService(
+        settings.default_workspace,
+        timeout_seconds=settings.codex_message_timeout_seconds,
+        db=db,
+    )
     telegram = TelegramAdapter(
         settings.telegram_bot_token,
         chunk_size=settings.telegram_long_message_chunk,
@@ -118,6 +124,9 @@ def build_app() -> FastAPI:
         command = text.split(maxsplit=1)[0].lower()
         return command in {
             "/status",
+            "/trace",
+            "/trace_raw",
+            "/cancel",
             "/help",
             "/pwd",
             "/mode",
@@ -148,7 +157,8 @@ def build_app() -> FastAPI:
             "/cmd_jobs",
             "/cmd_stop",
             "/cmd_stop_all",
-            "/cmd_logs",
+            "/log",
+            "/watch",
             "/cmd_status",
             "/cmd_reset",
         }
@@ -197,6 +207,12 @@ def build_app() -> FastAPI:
                 "update stage=send_text start",
                 extra={"update_id": normalized.update_id, "chat_id": normalized.chat_id},
             )
+            if not reply.strip():
+                logger.info(
+                    "skipping telegram send for empty reply",
+                    extra={"update_id": normalized.update_id, "chat_id": normalized.chat_id},
+                )
+                return reply
             if _is_local_bypass_command(normalized.text):
                 markdown = _render_local_markdown(normalized.text, reply)
                 if markdown is not None:
@@ -204,7 +220,7 @@ def build_app() -> FastAPI:
                 else:
                     await telegram.send_markdown_card(normalized.chat_id, normalized.text[:80], reply)
             else:
-                await telegram.send_text(normalized.chat_id, reply)
+                await telegram.send_codex_reply(normalized.chat_id, reply)
             t2 = asyncio.get_running_loop().time()
             logger.debug(
                 "update stage=send_text done",
@@ -363,13 +379,19 @@ def build_app() -> FastAPI:
             def _bucket(name: str) -> list[tuple[str, str]]:
                 if name in {"/new", "/reset", "/status", "/workspace", "/workspaces", "/session_label", "/pwd", "/mode"}:
                     return categories[0][1]
+                if name in {"/trace", "/trace_raw"}:
+                    return categories[0][1]
+                if name == "/cancel":
+                    return categories[0][1]
+                if name == "/timeout":
+                    return categories[0][1]
                 if name.startswith("/git_"):
                     return categories[1][1]
                 if name in {"/ls", "/tree", "/read", "/tail", "/find", "/grep"}:
                     return categories[2][1]
                 if name in {"/show", "/download"}:
                     return categories[3][1]
-                if name.startswith("/cmd"):
+                if name.startswith("/cmd") or name in {"/log", "/watch"}:
                     return categories[4][1]
                 return categories[5][1]
             for line in lines[1:]:
@@ -413,6 +435,8 @@ def build_app() -> FastAPI:
                 meta_lines.append(_inline_kv("thread", kv["thread_id"]))
             if "session_id" in kv:
                 meta_lines.append(_inline_kv("session", kv["session_id"]))
+            if "timeout_seconds" in kv:
+                meta_lines.append(_inline_kv("timeout", kv["timeout_seconds"]))
             if meta_lines:
                 blocks.append("")
                 blocks.extend(meta_lines)
@@ -460,9 +484,10 @@ def build_app() -> FastAPI:
         if cmd in {"/workspace", "/workspaces"}:
             title = _title("Workspace") if cmd == "/workspace" else _title("Allowed Workspaces")
             blocks = [title]
-            if "current_workspace" in kv:
-                blocks.append(_status_chip("project", _project_name(kv["current_workspace"])))
-            for key in ["current_workspace", "session_label", "default_workspace"]:
+            workspace_value = kv.get("workspace") or kv.get("current_workspace")
+            if workspace_value:
+                blocks.append(_status_chip("project", _project_name(workspace_value)))
+            for key in ["current_workspace", "workspace", "session_id", "session_label", "label", "default_workspace"]:
                 if key in kv:
                     blocks.append(_inline_kv(key, kv[key]))
             allowed = []
@@ -470,23 +495,40 @@ def build_app() -> FastAPI:
                 lines = [line.strip() for line in extra.splitlines() if line.strip() and line.strip() != "allowed_roots:"]
                 allowed.extend(lines)
             elif extra:
-                allowed.extend([line.strip() for line in extra.splitlines() if line.strip()])
+                extra_lines = [line.strip() for line in extra.splitlines() if line.strip()]
+                if extra_lines:
+                    blocks.append("")
+                    blocks.append(_section("Message"))
+                    for line in extra_lines:
+                        blocks.append(_bullet_text(line))
             if allowed:
                 blocks.append("")
                 blocks.append(_section("Roots"))
                 for item in allowed:
                     blocks.append(_bullet_code(item))
+            if len(blocks) == 1:
+                blocks.append(_bullet_text("No workspace details available."))
             return "\n".join(blocks)
 
-        if cmd in {"/cmd_status", "/cmd_jobs"}:
-            title = _title("Shell Jobs") if cmd == "/cmd_jobs" else _title("Shell Status")
+        if cmd in {"/cmd_status", "/cmd_jobs", "/log", "/watch"}:
+            title_map = {
+                "/cmd_status": _title("Shell Status"),
+                "/cmd_jobs": _title("Shell Jobs"),
+                "/log": _title("Shell Logs"),
+                "/watch": _title("Training Watch"),
+            }
+            title = title_map[cmd]
             blocks = [title]
             chips = []
             for key, short in [
+                ("conda_env", "conda"),
                 ("active_jobs", "jobs"),
                 ("latest_job_id", "latest"),
                 ("shell_busy", "busy"),
                 ("shell_last_exit_code", "last_exit"),
+                ("job_id", "job"),
+                ("pid", "pid"),
+                ("status", "status"),
             ]:
                 if key in kv:
                     chips.append(_status_chip(short, kv[key]))
@@ -496,6 +538,20 @@ def build_app() -> FastAPI:
                 blocks.append("")
                 blocks.append(_section("Current Directory"))
                 blocks.append(_bullet_code(kv["shell_cwd"]))
+            if cmd in {"/log", "/watch"}:
+                meta_lines = []
+                for key in ["label", "cwd", "log_path", "showing_last", "matched_lines", "keywords"]:
+                    if key in kv:
+                        meta_lines.append(_inline_kv(key, kv[key]))
+                if meta_lines:
+                    blocks.append("")
+                    blocks.append(_section("Metadata"))
+                    blocks.extend(meta_lines)
+                if extra:
+                    blocks.append("")
+                    blocks.append(_section("Matched Progress" if cmd == "/watch" else "Log Tail"))
+                    blocks.append(_code_block(extra))
+                return "\n".join(blocks)
             if extra:
                 job_lines = [line.strip() for line in extra.splitlines() if line.strip()]
                 jobs: list[tuple[str, str]] = []
@@ -528,6 +584,53 @@ def build_app() -> FastAPI:
                 elif cmd == "/cmd_status":
                     blocks.append("")
                     blocks.append(_code_block(extra))
+            return "\n".join(blocks)
+
+        if cmd in {"/trace", "/trace_raw"}:
+            title = _title("Codex Trace") if cmd == "/trace" else _title("Codex Trace Raw")
+            blocks = [title]
+            for key in [
+                "running",
+                "cancel_requested",
+                "active_pid",
+                "thread_id",
+                "event_count",
+                "timeout_seconds",
+                "last_return_code",
+                "current_started_at",
+                "current_finished_at",
+            ]:
+                if key in kv:
+                    blocks.append(_inline_kv(key, kv[key]))
+            for key, heading in [("current_prompt", "Prompt"), ("latest_reply_preview", "Reply Preview")]:
+                if key in kv and kv[key]:
+                    blocks.append("")
+                    blocks.append(_section(heading))
+                    blocks.append(_code_block(kv[key]))
+            if extra:
+                blocks.append("")
+                blocks.append(_section("Events"))
+                blocks.append(_code_block(extra))
+            return "\n".join(blocks)
+
+        if cmd in {"/conda", "/conda_envs", "/conda_off"}:
+            title_map = {
+                "/conda": _title("Conda"),
+                "/conda_envs": _title("Conda Environments"),
+                "/conda_off": _title("Conda"),
+            }
+            blocks = [title_map[cmd]]
+            for key in ["conda_env", "selected_conda_env", "previous", "path", "shell_cwd"]:
+                if key in kv:
+                    blocks.append(_inline_kv(key, kv[key]))
+            if extra:
+                extra_lines = [line.strip() for line in extra.splitlines() if line.strip()]
+                if extra_lines:
+                    blocks.append("")
+                    section = "Available" if cmd == "/conda_envs" else "Message"
+                    blocks.append(_section(section))
+                    for line in extra_lines:
+                        blocks.append(_bullet_code(line) if cmd == "/conda_envs" else _bullet_text(line))
             return "\n".join(blocks)
 
         if cmd == "/git_status":
@@ -643,6 +746,9 @@ def build_app() -> FastAPI:
                 },
             )
             return reply
+        except CodexReplyCancelled:
+            logger.info("codex reply cancelled", extra={"chat_id": chat_id})
+            return ""
         except Exception as exc:  # noqa: BLE001
             logger.exception("failed handling chat message")
             return f"Error talking to Codex backend: {exc}"
@@ -661,6 +767,7 @@ def build_app() -> FastAPI:
                 f"shell_exists: {status['exists']}\n"
                 f"shell_busy: {status['busy']}\n"
                 f"shell_cwd: {status.get('cwd') or status['workspace']}\n"
+                f"conda_env: {status.get('conda_env', '(default)')}\n"
                 f"shell_last_exit_code: {status['last_exit_code']}\n"
                 f"active_jobs: {len(status.get('active_job_ids', []))}\n"
                 f"latest_job_id: {status.get('latest_job_id')}"
@@ -686,6 +793,14 @@ def build_app() -> FastAPI:
                 except ValueError:
                     lines = 20
             return job_id, max(1, min(lines, 200))
+
+        def _parse_watch_args(raw: str) -> tuple[int | None, int, list[str]]:
+            left, right = _split_with_label(raw)
+            job_id, lines = _parse_tail_and_job(left)
+            if not right.strip():
+                return job_id, lines, []
+            keywords = [item.strip() for item in right.replace("，", ",").split(",") if item.strip()]
+            return job_id, lines, keywords
 
         def _split_args(raw_text: str) -> list[str]:
             return [token for token in raw_text.split() if token]
@@ -732,6 +847,10 @@ def build_app() -> FastAPI:
                 "/workspace [path] [:: label] - show or switch the current Codex workspace\n"
                 "/workspaces - list allowed workspace roots\n"
                 "/session_label <label> - update the current Codex session label\n"
+                "/trace [n] - show recent Codex event summaries for the current session\n"
+                "/trace_raw [n] - show recent raw Codex JSONL event lines\n"
+                "/cancel - stop the current Codex reply for this chat\n"
+                "/timeout [seconds] - show or set the current Codex reply timeout\n"
                 "/git_add <path> - stage a file or directory\n"
                 "/git_commit <message> - create a commit from staged changes\n"
                 "/git_show [ref] - show a commit with stats\n"
@@ -752,9 +871,13 @@ def build_app() -> FastAPI:
                 "/gpu - show GPU status from nvidia-smi\n"
                 "/cmd <command> - run a direct shell command in a persistent per-chat shell\n"
                 "/cmd_bg <command> - start a long-running shell job in the background\n"
+                "/conda [env] - show or switch the current conda environment for /cmd and /cmd_bg\n"
+                "/conda_envs - list available conda environments\n"
+                "/conda_off - clear the selected conda environment\n"
                 "/cmd_jobs - list shell background jobs for this chat\n"
                 "/cmd_status [lines] - show shell status and latest job tail\n"
-                "/cmd_logs [job_id] [lines] - tail a shell job log\n"
+                "/log [job_id] [lines] - tail a shell job log\n"
+                "/watch [job_id] [lines] [:: kw1,kw2] - show filtered training progress lines from a shell job log\n"
                 "/cmd_stop <job_id> - stop a background shell job\n"
                 "/cmd_stop_all - stop all background shell jobs for this chat\n"
                 "/cmd_reset - reset the per-chat shell session\n"
@@ -845,11 +968,36 @@ def build_app() -> FastAPI:
                 f"mode: {detail['integration_mode']}\n"
                 f"workspace: {detail['workspace_path']}\n"
                 f"thread_id: {detail['backend_status'].get('thread_id')}\n"
+                f"active_pid: {detail['backend_status'].get('active_pid')}\n"
+                f"cancel_requested: {detail['backend_status'].get('cancel_requested')}\n"
                 f"last_return_code: {detail['backend_status'].get('last_return_code')}\n"
                 f"{_shell_status_text(shell_status)}\n"
                 f"transcript_exists: {transcript_path.exists()}\n"
                 f"transcript_path: {transcript_path}\n"
                 f"latest_reply:\n{latest_reply_preview}"
+            )
+        if cmd == "/cancel":
+            result = session_service.cancel_chat_reply(chat_id)
+            if result.get("ok"):
+                return (
+                    "Cancellation requested.\n"
+                    f"session_id: {result['session_id']}\n"
+                    f"mode: {result['mode']}\n"
+                    f"workspace: {result['workspace']}\n"
+                    f"pid: {result.get('pid')}"
+                )
+            reason = result.get("reason", "unknown")
+            if reason == "not_running":
+                return (
+                    "No active Codex reply is running.\n"
+                    f"session_id: {result['session_id']}\n"
+                    f"mode: {result['mode']}\n"
+                    f"workspace: {result['workspace']}"
+                )
+            return (
+                "Unable to cancel Codex reply.\n"
+                f"session_id: {result['session_id']}\n"
+                f"reason: {reason}"
             )
         if cmd == "/git_add":
             raw = parts[1].strip() if len(parts) > 1 else ""
@@ -987,7 +1135,38 @@ def build_app() -> FastAPI:
                 f"pid: {job['pid']}\n"
                 f"cwd: {job['cwd']}\n"
                 f"log_path: {job['log_path']}\n"
-                f"Use /cmd_logs {job['job_id']} or /cmd_status"
+                f"Use /log {job['job_id']} or /cmd_status"
+            )
+        if cmd == "/conda":
+            raw = parts[1].strip() if len(parts) > 1 else ""
+            if not raw:
+                shell_status = shell_service.get_status(chat_id)
+                return (
+                    f"conda_env: {shell_status.get('conda_env', '(default)')}\n"
+                    f"shell_cwd: {shell_status.get('cwd') or command_workspace}\n"
+                    "Use /conda <env>, /conda_envs, or /conda_off"
+                )
+            selected = await asyncio.to_thread(shell_service.set_conda_env, chat_id, raw)
+            return (
+                "Conda environment updated.\n"
+                f"conda_env: {selected['conda_env']}\n"
+                f"path: {selected['path']}"
+            )
+        if cmd == "/conda_envs":
+            envs = await asyncio.to_thread(shell_service.list_conda_envs)
+            status = shell_service.get_status(chat_id)
+            lines = [f"selected_conda_env: {status.get('conda_env', '(default)')}"]
+            for env in envs:
+                marker = "*" if env["name"] == status.get("conda_env") else ("(base)" if env["active"] == "true" else "")
+                suffix = f" {marker}".rstrip()
+                lines.append(f"{env['name']}{suffix}: {env['path']}")
+            return "\n".join(lines)
+        if cmd == "/conda_off":
+            cleared = await asyncio.to_thread(shell_service.clear_conda_env, chat_id)
+            return (
+                "Conda environment cleared.\n"
+                f"previous: {cleared['previous']}\n"
+                f"conda_env: {cleared['conda_env']}"
             )
         if cmd == "/cmd_status":
             lines_value = 20
@@ -1008,7 +1187,7 @@ def build_app() -> FastAPI:
                 lines.append(f"#{job['job_id']} pid={job['pid']} {state_label}{label_part} cwd={job['cwd']}")
                 lines.append(f"cmd: {job['command']}")
             return "\n".join(lines)
-        if cmd == "/cmd_logs":
+        if cmd == "/log":
             raw = parts[1].strip() if len(parts) > 1 else ""
             job_id, lines_value = _parse_tail_and_job(raw)
             tail = await asyncio.to_thread(shell_service.tail_logs, chat_id, job_id, lines_value)
@@ -1025,6 +1204,27 @@ def build_app() -> FastAPI:
                 f"cwd: {job['cwd']}\n"
                 f"log_path: {job['log_path']}\n"
                 f"showing_last: {tail['shown_lines']} of {tail['line_count']} lines\n\n"
+                f"{body}"
+            )
+        if cmd == "/watch":
+            raw = parts[1].strip() if len(parts) > 1 else ""
+            job_id, lines_value, keywords = _parse_watch_args(raw)
+            watch = await asyncio.to_thread(shell_service.watch_logs, chat_id, job_id, lines_value, keywords or None)
+            if not watch["ok"]:
+                return watch["error"]
+            job = watch["job"]
+            state_label = "running" if job["running"] else f"exit={job['return_code']}"
+            body = watch["output"] or "(no matching progress lines found)"
+            return (
+                f"job_id: {job['job_id']}\n"
+                f"label: {job.get('label') or '(none)'}\n"
+                f"pid: {job['pid']}\n"
+                f"status: {state_label}\n"
+                f"cwd: {job['cwd']}\n"
+                f"log_path: {job['log_path']}\n"
+                f"matched_lines: {watch['matched_count']}\n"
+                f"keywords: {','.join(watch['keywords'])}\n"
+                f"showing_last: {watch['shown_lines']} matches\n\n"
                 f"{body}"
             )
         if cmd == "/cmd_stop":
@@ -1079,6 +1279,58 @@ def build_app() -> FastAPI:
         if cmd == "/mode":
             session = session_service.get_or_create_chat_session(chat_id)
             return f"Mode: {session['integration_mode']}"
+        if cmd == "/timeout":
+            raw = parts[1].strip() if len(parts) > 1 else ""
+            session = session_service.get_or_create_chat_session(chat_id)
+            status = session_service.get_session_status(session["session_id"])
+            current = status.get("backend_status", {}).get("timeout_seconds", settings.codex_message_timeout_seconds)
+            if not raw:
+                return (
+                    f"timeout_seconds: {current}\n"
+                    f"default_timeout_seconds: {settings.codex_message_timeout_seconds}"
+                )
+            try:
+                value = int(raw)
+            except ValueError:
+                return "Usage: /timeout <seconds>"
+            value = max(30, min(value, 3600))
+            updated = session_service.set_chat_timeout(chat_id, value)
+            effective = updated.get("backend_status", {}).get("timeout_seconds", value)
+            return (
+                "Codex timeout updated.\n"
+                f"timeout_seconds: {effective}\n"
+                f"default_timeout_seconds: {settings.codex_message_timeout_seconds}"
+            )
+        if cmd in {"/trace", "/trace_raw"}:
+            raw = parts[1].strip() if len(parts) > 1 else ""
+            lines_value = 20
+            if raw:
+                try:
+                    lines_value = max(5, min(int(raw), 200))
+                except ValueError:
+                    return f"Usage: {cmd} [lines]"
+            session = session_service.get_or_create_chat_session(chat_id)
+            status = session_service.get_session_status(session["session_id"])
+            backend_status = status.get("backend_status", {})
+            trace_key = "recent_raw_events" if cmd == "/trace_raw" else "recent_events"
+            trace_lines = backend_status.get(trace_key, [])[-lines_value:]
+            stderr_lines = backend_status.get("stderr_lines", [])[-min(lines_value, 40):]
+            header = [
+                f"running: {backend_status.get('running')}",
+                f"thread_id: {backend_status.get('thread_id')}",
+                f"event_count: {backend_status.get('event_count')}",
+                f"timeout_seconds: {backend_status.get('timeout_seconds')}",
+                f"last_return_code: {backend_status.get('last_return_code')}",
+                f"current_started_at: {backend_status.get('current_started_at')}",
+                f"current_finished_at: {backend_status.get('current_finished_at')}",
+                f"current_prompt: {backend_status.get('current_prompt') or '(none)'}",
+                f"latest_reply_preview: {backend_status.get('latest_reply_preview') or '(none)'}",
+            ]
+            body = trace_lines or ["(no trace events captured yet)"]
+            if stderr_lines:
+                body.extend(["", "[stderr]"])
+                body.extend(stderr_lines)
+            return "\n".join(header + [""] + body)
         if cmd == "/debug":
             diagnostics = await telegram.run_diagnostics()
             webhook_result = diagnostics.get("get_webhook_info", {}).get("result", {}) or {}
@@ -1160,6 +1412,11 @@ def build_app() -> FastAPI:
 
         if settings.telegram_debug_mode:
             logger.info("-" * 60)
+
+        restored_sessions = await asyncio.to_thread(session_service.rehydrate_persisted_sessions)
+        logger.info("rehydrated %d persisted chat session(s)", len(restored_sessions))
+        restored_shells = await asyncio.to_thread(shell_service.restore_persisted_state)
+        logger.info("rehydrated %d persisted shell session(s)", len(restored_shells))
 
         # --- Start polling or webhook ---
         if settings.telegram_mode == "polling":

@@ -35,6 +35,7 @@ class Settings(BaseSettings):
     codex_cli_args: str = Field(default="", alias="CODEX_CLI_ARGS")
     codex_message_timeout_seconds: int = Field(default=120, alias="CODEX_MESSAGE_TIMEOUT_SECONDS")
     codex_debug_mode: bool = Field(default=False, alias="CODEX_DEBUG_MODE")
+    codex_web_search_enabled: bool = Field(default=False, alias="CODEX_WEB_SEARCH_ENABLED")
     shared_proxy_url: str = Field(default="", alias="SHARED_PROXY_URL")
     shared_proxy_port: int = Field(default=0, alias="SHARED_PROXY_PORT")
     shared_proxy_scheme: str = Field(default="socks5h", alias="SHARED_PROXY_SCHEME")

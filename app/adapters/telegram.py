@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import mimetypes
+import re
 import socket
 import time
 from pathlib import Path
@@ -16,6 +17,13 @@ from app.schemas import TelegramInboundMessage
 
 logger = logging.getLogger(__name__)
 _MARKDOWN_V2_SPECIALS = r"_*[]()~`>#+-=|{}.!"
+_CODE_FENCE_RE = re.compile(r"```(?P<lang>[^\n`]*)\n(?P<body>.*?)```", flags=re.DOTALL)
+_INLINE_TOKEN_RE = re.compile(r"(`[^`\n]+`|\*\*[^*\n]+\*\*|\[[^\]]+\]\([^)]+\))")
+_NUMBERED_RE = re.compile(r"^(?P<num>\d+)\.\s+(?P<body>.+)$")
+_BULLET_RE = re.compile(r"^[-*•]\s+(?P<body>.+)$")
+_LOCAL_LINK_LINE_RE = re.compile(r"L(?P<line>\d+)(?:C(?P<col>\d+))?$")
+_LOCAL_LINK_TOKEN_RE = re.compile(r"\[(?P<label>[^\]]+)\]\((?P<target>/[^)]+)\)")
+_CODE_LANG_RE = re.compile(r"[^A-Za-z0-9_+#.-]+")
 
 
 def _mask_token(token: str) -> str:
@@ -404,6 +412,11 @@ class TelegramAdapter:
     async def send_markdown(self, chat_id: int, markdown_text: str) -> None:
         await self.send_text(chat_id, markdown_text, parse_mode="MarkdownV2")
 
+    async def send_codex_reply(self, chat_id: int, body: str) -> None:
+        messages = self._render_codex_reply_messages(body)
+        for message in messages:
+            await self.send_text(chat_id, message, parse_mode="MarkdownV2")
+
     async def send_photo(self, chat_id: int, path: str | Path, caption: str | None = None) -> None:
         file_path = Path(path)
         payload: dict[str, Any] = {"chat_id": str(chat_id)}
@@ -577,6 +590,183 @@ class TelegramAdapter:
         if not messages:
             messages.append(f"*{title_text}*\n`(empty)`")
         return messages
+
+    def _render_codex_reply_messages(self, body: str) -> list[str]:
+        body = (body or "").strip()
+        if not body:
+            return ["*Codex Reply*\n`(empty)`"]
+
+        blocks: list[str] = []
+        cursor = 0
+        for match in _CODE_FENCE_RE.finditer(body):
+            prose = body[cursor : match.start()]
+            blocks.extend(self._render_codex_prose_blocks(prose))
+            lang = self._normalize_code_language(match.group("lang"))
+            code = match.group("body").strip("\n")
+            if code:
+                blocks.append(self._render_code_block(code, lang))
+            cursor = match.end()
+        blocks.extend(self._render_codex_prose_blocks(body[cursor:]))
+
+        messages: list[str] = []
+        current = "*Codex Reply*"
+        for block in blocks:
+            if self._is_section_boundary(block) and current != "*Codex Reply*":
+                messages.append(current)
+                current = "*Codex Reply*"
+            candidate = f"{current}\n\n{block}" if current else block
+            if len(candidate) <= self.chunk_size:
+                current = candidate
+                continue
+            if current and current != "*Codex Reply*":
+                messages.append(current)
+            current = block
+            if len(current) > self.chunk_size and current.startswith("```"):
+                header, _, rest = current.partition("\n")
+                code_body = rest.removesuffix("\n```")
+                lang = self._normalize_code_language(header.removeprefix("```"))
+                for idx, chunk in enumerate(self._chunk_code_block(code_body), start=1):
+                    prefix = "*Codex Reply*\n\n" if idx == 1 else "*Codex Reply \\(cont\\.\\)*\n\n"
+                    messages.append(f"{prefix}{self._render_code_block(chunk, lang)}")
+                current = ""
+        if current:
+            messages.append(current)
+        return messages or ["*Codex Reply*\n`(empty)`"]
+
+    def _render_codex_prose_blocks(self, prose: str) -> list[str]:
+        lines = prose.splitlines()
+        blocks: list[str] = []
+        paragraph: list[str] = []
+
+        def flush_paragraph() -> None:
+            nonlocal paragraph
+            if not paragraph:
+                return
+            text = " ".join(item.strip() for item in paragraph if item.strip())
+            if text:
+                reference_blocks = self._maybe_render_reference_blocks(text)
+                if reference_blocks is not None:
+                    blocks.extend(reference_blocks)
+                else:
+                    blocks.append(self._render_codex_inline(text))
+            paragraph = []
+
+        for raw_line in lines:
+            stripped = raw_line.strip()
+            if not stripped:
+                flush_paragraph()
+                continue
+            if stripped in {"---", "——", "___"}:
+                flush_paragraph()
+                continue
+
+            heading_text = self._normalize_heading_line(stripped)
+            if heading_text is not None:
+                flush_paragraph()
+                blocks.append(f"*{self._escape_markdown_v2(heading_text)}*")
+                continue
+
+            bullet_match = _BULLET_RE.match(stripped)
+            if bullet_match:
+                flush_paragraph()
+                blocks.append(f"• {self._render_codex_inline(bullet_match.group('body'))}")
+                continue
+
+            numbered_match = _NUMBERED_RE.match(stripped)
+            if numbered_match:
+                flush_paragraph()
+                number = self._escape_markdown_v2(numbered_match.group("num"))
+                blocks.append(f"{number}\\. {self._render_codex_inline(numbered_match.group('body'))}")
+                continue
+
+            if stripped.endswith(":") and len(stripped) <= 40:
+                flush_paragraph()
+                blocks.append(f"*{self._escape_markdown_v2(stripped[:-1])}*")
+                continue
+
+            paragraph.append(stripped)
+
+        flush_paragraph()
+        return blocks
+
+    def _normalize_heading_line(self, text: str) -> str | None:
+        if text.startswith("#"):
+            return text.lstrip("#").strip() or None
+        if text.startswith("**") and text.endswith("**") and text.count("**") == 2:
+            return text[2:-2].strip() or None
+        return None
+
+    def _render_codex_inline(self, text: str) -> str:
+        parts: list[str] = []
+        cursor = 0
+        for match in _INLINE_TOKEN_RE.finditer(text):
+            if match.start() > cursor:
+                parts.append(self._escape_markdown_v2(text[cursor : match.start()]))
+            token = match.group(0)
+            if token.startswith("`") and token.endswith("`"):
+                parts.append(f"`{self._escape_inline_code(token[1:-1])}`")
+            elif token.startswith("**") and token.endswith("**"):
+                parts.append(f"*{self._escape_markdown_v2(token[2:-2])}*")
+            elif token.startswith("["):
+                parts.append(self._render_codex_link_token(token))
+            cursor = match.end()
+        if cursor < len(text):
+            parts.append(self._escape_markdown_v2(text[cursor:]))
+        return "".join(parts)
+
+    def _render_codex_link_token(self, token: str) -> str:
+        label, target = token[1:].split("](", 1)
+        target = target[:-1]
+        suffix = ""
+        if "#" in target:
+            _, frag = target.split("#", 1)
+            line_match = _LOCAL_LINK_LINE_RE.fullmatch(frag)
+            if line_match:
+                suffix = f" `L{line_match.group('line')}`"
+        return f"*{self._escape_markdown_v2(label)}*{suffix}"
+
+    def _maybe_render_reference_blocks(self, text: str) -> list[str] | None:
+        matches = list(_LOCAL_LINK_TOKEN_RE.finditer(text))
+        if not matches:
+            return None
+        connector_text = _LOCAL_LINK_TOKEN_RE.sub(" ", text)
+        normalized = re.sub(r"[，。、“”‘’：:;；,.!！?？()\s]+", "", connector_text)
+        normalized = (
+            normalized.replace("见", "")
+            .replace("參见", "")
+            .replace("参见", "")
+            .replace("参考", "")
+            .replace("另见", "")
+            .replace("和", "")
+            .replace("与", "")
+            .replace("及", "")
+            .replace("以及", "")
+            .replace("and", "")
+            .replace("or", "")
+        )
+        if normalized:
+            return None
+        blocks = ["*References*"]
+        for match in matches:
+            blocks.append(f"• {self._render_codex_link_token(match.group(0))}")
+        return blocks
+
+    @staticmethod
+    def _is_heading_block(block: str) -> bool:
+        return block.startswith("*") and block.endswith("*") and "\n" not in block and not block.startswith("• ")
+
+    @classmethod
+    def _is_section_boundary(cls, block: str) -> bool:
+        return cls._is_heading_block(block) and block != "*References*"
+
+    def _render_code_block(self, text: str, language: str | None = None) -> str:
+        lang = self._normalize_code_language(language)
+        return f"```{lang}\n{self._escape_code_block(text)}\n```"
+
+    def _normalize_code_language(self, language: str | None) -> str:
+        raw = (language or "").strip()
+        cleaned = _CODE_LANG_RE.sub("", raw)
+        return cleaned or "text"
 
     def _chunk_markdown_message(self, text: str) -> list[str]:
         if len(text) <= self.chunk_size:

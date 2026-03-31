@@ -4,8 +4,7 @@
 </h1>
 
 <p align="center">
-  <strong>Operate Codex from Telegram like a real remote workstation, not a toy bot.</strong><br />
-  A deployable bridge for chat-driven coding, session continuity, controlled workspaces, and server-friendly operations.
+  <strong>Operate Codex from Telegram through a small FastAPI bridge with workspace controls and session continuity.</strong>
 </p>
 
 <p align="center">
@@ -23,15 +22,9 @@
   <img src="./assets/remote-coding-flow.png" alt="RemoteCoder Open remote coding flow" width="100%" />
 </p>
 
-This project gives you a small FastAPI backend that:
+This repository contains the public application code for a Telegram-to-Codex bridge. It accepts Telegram messages, maps each chat to a Codex session, returns responses back to Telegram, and stores lightweight session state locally.
 
-- receives Telegram bot messages,
-- maps each Telegram chat to a Codex session,
-- forwards prompts to Codex,
-- returns results back to Telegram,
-- keeps lightweight session and audit state in SQLite.
-
-It is intentionally thin. Codex remains the execution engine; this repository focuses on transport, safety boundaries, and operations.
+The public branch intentionally excludes machine-specific deployment scripts, runtime data, logs, chat history, and private environment files.
 
 ## Features
 
@@ -41,7 +34,6 @@ It is intentionally thin. Codex remains the execution engine; this repository fo
 - Shared proxy support for both Codex and Telegram requests
 - SQLite-backed session and audit persistence
 - Health and session inspection endpoints
-- User-level `systemd` autostart example for Linux servers
 
 ## Architecture
 
@@ -61,7 +53,7 @@ Telegram User
 
 ### 1. Requirements
 
-- Linux server or Linux dev machine
+- Linux development environment
 - Python 3.12+
 - Codex CLI installed and available on `PATH`
 - A Telegram bot token from `@BotFather`
@@ -90,7 +82,7 @@ ALLOWED_WORKSPACES=
 Notes:
 
 - If `ALLOWED_WORKSPACES` is empty, only `DEFAULT_WORKSPACE` is allowed.
-- Use absolute paths.
+- Use absolute paths for workspaces.
 - Do not commit your real `.env`.
 
 ### 4. Run locally
@@ -141,59 +133,15 @@ Common ones:
 - `SHARED_PROXY_PORT`
 - `SHARED_PROXY_SCHEME`
 
-### Proxy support
+## Running On A Server
 
-If your server must use Clash or another proxy, set either:
+Use your own process manager or service wrapper for deployment. This public repository intentionally does not include machine-specific startup scripts or service templates.
 
-- `SHARED_PROXY_URL=socks5h://127.0.0.1:7890`
-- `SHARED_PROXY_PORT=7890`
-
-The bridge applies the effective proxy to:
-
-- Codex subprocesses
-- Telegram API calls
-
-## Linux Server Deployment
-
-### Option A: run manually
+Minimal example:
 
 ```bash
 source .venv/bin/activate
 uvicorn app.main:app --host 0.0.0.0 --port 8000
-```
-
-### Option B: user-level `systemd`
-
-This repository includes a user-service example:
-
-- `deploy/systemd/remotecoder.service`
-- `scripts/start_remotecoder.sh`
-- `scripts/install_user_autostart.sh`
-
-What the scripts do:
-
-- `scripts/start_remotecoder.sh` loads your shell environment, runs `clash on`, activates `conda activate coder`, and starts the app
-- `scripts/install_user_autostart.sh` renders the `systemd` template with your local repository path and installs it into `~/.config/systemd/user`
-
-Install it:
-
-```bash
-./scripts/install_user_autostart.sh
-```
-
-Manage it:
-
-```bash
-systemctl --user start remotecoder.service
-systemctl --user stop remotecoder.service
-systemctl --user restart remotecoder.service
-systemctl --user status remotecoder.service
-```
-
-If you need true boot-time start before login, your admin may also need:
-
-```bash
-sudo loginctl enable-linger <your-user>
 ```
 
 ## Example Telegram Commands
@@ -232,17 +180,15 @@ app/
   logging.py
   main.py
   schemas.py
-deploy/systemd/
-scripts/
+tests/
 .env.example
 requirements.txt
 ```
 
 ## Security Notes
 
-- Never commit `.env`, logs, chat histories, or SQLite databases.
+- Never commit `.env`, logs, chat histories, SQLite databases, or machine-specific deployment scripts.
 - Restrict `DEFAULT_WORKSPACE` and `ALLOWED_WORKSPACES` carefully.
-- Use a dedicated Linux user when deploying on a server.
 - Treat Telegram chat access as operational access to your Codex workflow.
 
 ## Troubleshooting
@@ -251,7 +197,6 @@ requirements.txt
 
 - Verify `TELEGRAM_BOT_TOKEN`
 - Check `curl http://127.0.0.1:8000/health`
-- Inspect `logs/bridge.log`
 - Confirm outbound access to `api.telegram.org`
 
 ### Codex calls fail
@@ -264,13 +209,6 @@ requirements.txt
 
 - Make sure `DEFAULT_WORKSPACE` exists
 - Make sure the target path is allowed by `ALLOWED_WORKSPACES`
-
-## Roadmap
-
-- Real Codex SDK mode
-- Better webhook deployment docs
-- Richer Telegram attachments
-- More admin and diagnostics commands
 
 ## License
 

@@ -11,8 +11,16 @@ class WorkspaceGuard:
         self.default_workspace = default_workspace.resolve()
         self.ensure_allowed(self.default_workspace)
 
-    def normalize(self, workspace: str | Path | None) -> Path:
-        candidate = self.default_workspace if workspace is None else Path(workspace).expanduser().resolve()
+    def normalize(self, workspace: str | Path | None, base_workspace: str | Path | None = None) -> Path:
+        if workspace is None:
+            candidate = self.default_workspace
+        else:
+            raw = Path(workspace).expanduser()
+            if raw.is_absolute():
+                candidate = raw.resolve()
+            else:
+                base = Path(base_workspace).expanduser().resolve() if base_workspace is not None else self.default_workspace
+                candidate = (base / raw).resolve()
         self.ensure_allowed(candidate)
         return candidate
 

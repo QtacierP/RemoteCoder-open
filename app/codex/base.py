@@ -14,6 +14,10 @@ class CodexSessionInfo:
     mode: str
 
 
+class CodexReplyCancelled(RuntimeError):
+    """Raised when a running Codex reply is cancelled by the user."""
+
+
 class CodexBackend(ABC):
     @abstractmethod
     def create_session(self, session_id: str, workspace: Path) -> CodexSessionInfo: ...
@@ -29,3 +33,6 @@ class CodexBackend(ABC):
 
     @abstractmethod
     def close_session(self, session_id: str) -> None: ...
+
+    def cancel_running_reply(self, session_id: str) -> dict:
+        return {"ok": False, "reason": "unsupported"}

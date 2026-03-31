@@ -2,16 +2,16 @@ __pycache__/
 *.py[cod]
 
 .env
+.env.*
+!.env.example
 .venv/
 .pytest_cache/
 
-data/*
-!data/.gitkeep
-
-logs/*
-!logs/.gitkeep
-
-history_conversations/*
-!history_conversations/.gitkeep
-
+data/
+logs/
+history_conversations/
 error.log
+scripts/
+deploy/
+tmp/
+.cache/

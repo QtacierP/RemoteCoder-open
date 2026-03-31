@@ -29,6 +29,25 @@ class SessionService:
         self.backends = backends
         self.default_mode = default_mode
 
+    @staticmethod
+    def _runtime_backend_state(backend_status: dict) -> dict:
+        state: dict[str, object] = {}
+        for key in ("thread_id", "timeout_seconds", "last_return_code", "latest_reply_preview"):
+            value = backend_status.get(key)
+            if value is not None:
+                state[key] = value
+        return state
+
+    def _persist_backend_state(self, session_id: str) -> None:
+        session = self.db.get_session(session_id)
+        if session is None:
+            raise KeyError(session_id)
+        mode = session["integration_mode"]
+        backend_status = self.backends[mode].get_status(session_id)
+        if not backend_status.get("exists"):
+            return
+        self.db.update_session_backend_state(session_id, self._runtime_backend_state(backend_status))
+
     def get_or_create_chat_session(self, chat_id: int) -> dict:
         existing = self.db.get_chat_session(chat_id)
         if existing:
@@ -53,6 +72,7 @@ class SessionService:
             "chat_id": chat_id,
             "integration_mode": mode,
             "label": label.strip(),
+            "backend_state": {},
             "workspace_path": str(workspace_path),
             "status": "active",
             "created_at": now,
@@ -81,7 +101,7 @@ class SessionService:
     def switch_chat_workspace(self, chat_id: int, workspace: str | Path, label: str | None = None) -> dict:
         current = self.get_or_create_chat_session(chat_id)
         mode = current["integration_mode"]
-        new_workspace = self.workspace_guard.normalize(workspace)
+        new_workspace = self.workspace_guard.normalize(workspace, base_workspace=current["workspace_path"])
         if Path(current["workspace_path"]).resolve() == new_workspace:
             if label is not None and label.strip() != current.get("label", ""):
                 self.db.update_session_label(current["session_id"], label.strip())
@@ -149,6 +169,7 @@ class SessionService:
             "session pipeline stage=backend_send done",
             extra={"chat_id": chat_id, "session_id": session["session_id"], "mode": mode, "output_len": len(output)},
         )
+        self._persist_backend_state(session["session_id"])
         self.db.update_session_status(session["session_id"], "active")
         return session, output
 
@@ -160,7 +181,14 @@ class SessionService:
             return
 
         workspace = Path(session["workspace_path"])
-        backend.create_session(session_id=session["session_id"], workspace=workspace)
+        restore = getattr(backend, "restore_session", None)
+        backend_state = session.get("backend_state") or {}
+        restored = False
+        if callable(restore):
+            restore(session_id=session["session_id"], workspace=workspace, backend_state=backend_state)
+            restored = bool(backend_state)
+        else:
+            backend.create_session(session_id=session["session_id"], workspace=workspace)
         logger.warning(
             "recreated missing backend session from persisted mapping",
             extra={
@@ -168,13 +196,14 @@ class SessionService:
                 "chat_id": session["chat_id"],
                 "mode": mode,
                 "workspace": session["workspace_path"],
+                "restored_backend_state": restored,
             },
         )
         self.audit.log(
             "session_rehydrated",
             session["chat_id"],
             session["session_id"],
-            {"mode": mode, "workspace": session["workspace_path"]},
+            {"mode": mode, "workspace": session["workspace_path"], "restored_backend_state": restored},
         )
 
     def get_session_status(self, session_id: str) -> dict:
@@ -188,5 +217,47 @@ class SessionService:
     def list_sessions(self) -> list[dict]:
         return self.db.list_sessions()
 
+    def rehydrate_persisted_sessions(self) -> list[dict]:
+        restored: list[dict] = []
+        for session in self.db.list_current_chat_sessions():
+            self._ensure_backend_session(session)
+            restored.append(
+                {
+                    "session_id": session["session_id"],
+                    "chat_id": session["chat_id"],
+                    "mode": session["integration_mode"],
+                    "workspace": session["workspace_path"],
+                    "restored_backend_state": bool(session.get("backend_state")),
+                }
+            )
+        return restored
+
     def get_chat(self, chat_id: int) -> dict | None:
         return self.db.get_chat_session(chat_id)
+
+    def set_chat_timeout(self, chat_id: int, timeout_seconds: int) -> dict:
+        session = self.get_or_create_chat_session(chat_id)
+        mode = session["integration_mode"]
+        backend = self.backends[mode]
+        setter = getattr(backend, "set_session_timeout", None)
+        if setter is None:
+            raise ValueError(f"Timeout override is not supported for mode: {mode}")
+        setter(session["session_id"], timeout_seconds)
+        self._persist_backend_state(session["session_id"])
+        return self.get_session_status(session["session_id"])
+
+    def cancel_chat_reply(self, chat_id: int) -> dict:
+        session = self.get_or_create_chat_session(chat_id)
+        mode = session["integration_mode"]
+        backend = self.backends[mode]
+        result = backend.cancel_running_reply(session["session_id"])
+        if result.get("ok"):
+            self.db.update_session_status(session["session_id"], "cancelled")
+            self.audit.log("reply_cancelled", chat_id, session["session_id"], {"pid": result.get("pid")})
+        self._persist_backend_state(session["session_id"])
+        return {
+            "session_id": session["session_id"],
+            "workspace": session["workspace_path"],
+            "mode": mode,
+            **result,
+        }
