@@ -1,0 +1,43 @@
+<svg width="1200" height="420" viewBox="0 0 1200 420" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="88" y1="48" x2="1085" y2="390" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#0B1220"/>
+      <stop offset="0.52" stop-color="#12243A"/>
+      <stop offset="1" stop-color="#123A4A"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="205" y1="118" x2="933" y2="339" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#2DD4BF"/>
+      <stop offset="1" stop-color="#60A5FA"/>
+    </linearGradient>
+    <filter id="blur" x="688" y="24" width="420" height="420" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feGaussianBlur stdDeviation="40"/>
+    </filter>
+  </defs>
+  <rect width="1200" height="420" rx="28" fill="url(#bg)"/>
+  <rect x="40" y="40" width="1120" height="340" rx="24" fill="white" fill-opacity="0.03" stroke="white" stroke-opacity="0.08"/>
+  <g opacity="0.85" filter="url(#blur)">
+    <circle cx="898" cy="234" r="130" fill="#2DD4BF"/>
+    <circle cx="972" cy="182" r="92" fill="#60A5FA"/>
+  </g>
+  <rect x="92" y="102" width="150" height="150" rx="32" fill="#0F172A" stroke="rgba(255,255,255,0.08)"/>
+  <rect x="116" y="126" width="102" height="102" rx="24" fill="url(#accent)"/>
+  <path d="M142 175.5H190" stroke="#0B1220" stroke-width="10" stroke-linecap="round"/>
+  <path d="M166 151.5V199.5" stroke="#0B1220" stroke-width="10" stroke-linecap="round"/>
+  <path d="M242 175.5H300" stroke="#2DD4BF" stroke-width="8" stroke-linecap="round"/>
+  <path d="M332 175.5H390" stroke="#60A5FA" stroke-width="8" stroke-linecap="round"/>
+  <path d="M422 175.5H480" stroke="#2DD4BF" stroke-width="8" stroke-linecap="round"/>
+  <text x="92" y="298" fill="white" font-family="Segoe UI, Arial, sans-serif" font-size="50" font-weight="700">RemoteCoder Open</text>
+  <text x="92" y="338" fill="#C7D2E0" font-family="Segoe UI, Arial, sans-serif" font-size="24">Run Codex from Telegram with a deployable bridge built for real remote workflows.</text>
+  <rect x="92" y="360" width="174" height="22" rx="11" fill="#2DD4BF" fill-opacity="0.18"/>
+  <text x="108" y="376" fill="#7DEADB" font-family="Segoe UI, Arial, sans-serif" font-size="14" font-weight="700">Telegram</text>
+  <text x="186" y="376" fill="#7DEADB" font-family="Segoe UI, Arial, sans-serif" font-size="14">→</text>
+  <text x="202" y="376" fill="#7DEADB" font-family="Segoe UI, Arial, sans-serif" font-size="14" font-weight="700">Codex</text>
+  <rect x="720" y="96" width="336" height="204" rx="20" fill="#08111D" stroke="rgba(255,255,255,0.08)"/>
+  <rect x="744" y="122" width="124" height="18" rx="9" fill="#2DD4BF" fill-opacity="0.22"/>
+  <rect x="744" y="156" width="282" height="12" rx="6" fill="white" fill-opacity="0.1"/>
+  <rect x="744" y="178" width="240" height="12" rx="6" fill="white" fill-opacity="0.08"/>
+  <rect x="744" y="210" width="82" height="24" rx="12" fill="#2563EB"/>
+  <rect x="836" y="210" width="96" height="24" rx="12" fill="#14B8A6"/>
+  <rect x="744" y="256" width="140" height="18" rx="9" fill="#60A5FA" fill-opacity="0.24"/>
+  <rect x="744" y="288" width="220" height="12" rx="6" fill="white" fill-opacity="0.08"/>
+</svg>

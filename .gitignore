@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+
+.env
+.venv/
+.pytest_cache/
+
+data/*
+!data/.gitkeep
+
+logs/*
+!logs/.gitkeep
+
+history_conversations/*
+!history_conversations/.gitkeep
+
+error.log
