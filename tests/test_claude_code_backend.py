@@ -53,7 +53,7 @@ def test_claude_code_backend_returns_reply_and_captures_stderr(tmp_path: Path) -
     backend.set_session_provider(
         session.session_id,
         {
-            "label": "doubao",
+            "label": "provider-a",
             "model": "demo-model",
             "base_url": "https://example.invalid",
             "api_key": "secret",
@@ -100,7 +100,7 @@ def test_claude_code_backend_surfaces_nonzero_exit_with_stderr(tmp_path: Path) -
     backend.set_session_provider(
         session.session_id,
         {
-            "label": "doubao",
+            "label": "provider-a",
             "model": "demo-model",
             "base_url": "https://example.invalid",
             "api_key": "secret",
@@ -131,7 +131,7 @@ def test_claude_code_backend_includes_thinking_flag(tmp_path: Path) -> None:
     backend.set_session_provider(
         session.session_id,
         {
-            "label": "doubao",
+            "label": "provider-a",
             "model": "demo-model",
             "base_url": "https://example.invalid",
             "api_key": "secret",
@@ -153,7 +153,7 @@ def test_claude_code_backend_records_progress_heartbeat_for_slow_tasks(tmp_path:
     backend.set_session_provider(
         session.session_id,
         {
-            "label": "kimi",
+            "label": "provider-b",
             "model": "demo-model",
             "base_url": "https://example.invalid",
             "api_key": "secret",

@@ -39,7 +39,7 @@ def test_claude_proxy_service_forwards_messages() -> None:
                 "id": "msg_test",
                 "type": "message",
                 "role": "assistant",
-                "model": "doubao-seed-code-preview-latest",
+                "model": "provider-model-v1",
                 "content": [{"type": "text", "text": "4"}],
                 "stop_reason": "end_turn",
                 "usage": {"input_tokens": 1, "output_tokens": 1},
@@ -70,7 +70,7 @@ def test_claude_proxy_service_forwards_messages() -> None:
             f"http://127.0.0.1:{proxy_port}/v1/messages?beta=true",
             data=json.dumps(
                 {
-                    "model": "doubao-seed-code-preview-latest",
+                    "model": "provider-model-v1",
                     "max_tokens": 64,
                     "messages": [{"role": "user", "content": "2+2?"}],
                 }
@@ -92,7 +92,7 @@ def test_claude_proxy_service_forwards_messages() -> None:
         assert captured["authorization"] == "Bearer secret-token"
         assert captured["anthropic_version"] == "2023-06-01"
         assert captured["body"] == {
-            "model": "doubao-seed-code-preview-latest",
+            "model": "provider-model-v1",
             "max_tokens": 64,
             "messages": [{"role": "user", "content": "2+2?"}],
         }

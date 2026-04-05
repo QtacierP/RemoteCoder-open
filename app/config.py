@@ -45,7 +45,7 @@ class Settings(BaseSettings):
     claude_code_proxy_host: str = Field(default="127.0.0.1", alias="CLAUDE_CODE_PROXY_HOST")
     claude_code_proxy_port: int = Field(default=18080, alias="CLAUDE_CODE_PROXY_PORT")
     claude_code_proxy_upstream_base: str = Field(
-        default="https://ark.cn-beijing.volces.com/api/coding",
+        default="https://provider.example.invalid/v1",
         alias="CLAUDE_CODE_PROXY_UPSTREAM_BASE",
     )
     claude_code_proxy_upstream_key: str = Field(default="", alias="CLAUDE_CODE_PROXY_UPSTREAM_KEY")

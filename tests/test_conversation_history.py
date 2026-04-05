@@ -46,7 +46,7 @@ def test_extract_reply_filters_claude_session_noise(tmp_path: Path) -> None:
     reply = service.extract_reply(
         "Session 12345678-1234-1234-1234-123456789abc (claude_code_cli_session)\n"
         "Claude Code\n"
-        "model: kimi-k2.5\n"
+        "model: provider-model-v1\n"
         "directory: /workspace/project\n"
         "最终答案"
     )

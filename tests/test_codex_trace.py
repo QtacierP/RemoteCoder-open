@@ -62,7 +62,7 @@ def test_cli_backend_switches_provider_and_exposes_status() -> None:
         {
             "label": "relay",
             "model": "gpt-5.4",
-            "base_url": "https://relay.example/v1",
+            "base_url": "https://provider.example.invalid/v1",
             "api_key": "secret-token",
         },
     )
@@ -70,5 +70,5 @@ def test_cli_backend_switches_provider_and_exposes_status() -> None:
 
     assert status["provider_label"] == "relay"
     assert status["provider_model"] == "gpt-5.4"
-    assert status["provider_base_url"] == "https://relay.example/v1"
+    assert status["provider_base_url"] == "https://provider.example.invalid/v1"
     assert status["thread_id"] is None

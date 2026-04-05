@@ -1,6 +1,6 @@
 <h1 align="center">
-  <img src="./assets/icon.png" alt="RemoteCoder Open icon" width="72" valign="middle" />
-  RemoteCoder Open
+  <img src="./assets/project-mark.png" alt="RemoteCoder icon" width="72" valign="middle" />
+  RemoteCoder
 </h1>
 
 <p align="center">
@@ -9,18 +9,17 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/QtacierP/RemoteCoder-open/stargazers"><img src="https://img.shields.io/github/stars/QtacierP/RemoteCoder-open?style=social" alt="GitHub stars"></a>
-  <a href="./LICENSE"><img src="https://img.shields.io/github/license/QtacierP/RemoteCoder-open" alt="License"></a>
   <a href="https://www.python.org/"><img src="https://img.shields.io/badge/python-3.12+-blue" alt="Python 3.12+"></a>
   <a href="https://fastapi.tiangolo.com/"><img src="https://img.shields.io/badge/FastAPI-0.116-009688" alt="FastAPI 0.116"></a>
+  <a href="./LICENSE"><img src="https://img.shields.io/badge/license-MIT-111827" alt="MIT License"></a>
 </p>
 
 <p align="center">
-  <img src="./assets/hero-banner.svg" alt="RemoteCoder Open banner" width="100%" />
+  <img src="./assets/project-banner.svg" alt="RemoteCoder banner" width="100%" />
 </p>
 
 <p align="center">
-  <img src="./assets/remote-coding-flow.png" alt="RemoteCoder Open remote coding flow" width="100%" />
+  <img src="./assets/workflow-overview.png" alt="RemoteCoder workflow overview" width="100%" />
 </p>
 
 This project gives you a small FastAPI backend that:
@@ -69,7 +68,7 @@ Telegram User
 ### 2. Clone and install
 
 ```bash
-git clone https://github.com/QtacierP/RemoteCoder-open.git
+git clone https://github.com/<your-account>/RemoteCoder-open.git
 cd RemoteCoder-open
 python3 -m venv .venv
 source .venv/bin/activate

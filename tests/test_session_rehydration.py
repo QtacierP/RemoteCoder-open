@@ -324,19 +324,19 @@ def test_list_claude_code_providers_includes_empty_default(tmp_path: Path) -> No
 
 def test_list_claude_code_providers_uses_configured_default(tmp_path: Path) -> None:
     backend = FakeBackend(mode="codex_cli_session")
-    service = _build_service(tmp_path, backend, default_claude_code_provider_label="doubao")
+    service = _build_service(tmp_path, backend, default_claude_code_provider_label="provider-a")
     service.add_claude_code_provider(
-        label="doubao",
-        model="doubao-seed-2.0-code",
-        base_url="https://ark.cn-beijing.volces.com/api/coding",
+        label="provider-a",
+        model="provider-model-v2",
+        base_url="https://provider.example.invalid/v1",
         api_key="secret-token",
     )
 
     providers = service.list_claude_code_providers()
 
     assert providers[0]["label"] == "default"
-    assert providers[0]["model"] == "doubao-seed-2.0-code"
-    assert providers[0]["base_url"] == "https://ark.cn-beijing.volces.com/api/coding"
+    assert providers[0]["model"] == "provider-model-v2"
+    assert providers[0]["base_url"] == "https://provider.example.invalid/v1"
     assert providers[0]["is_default"] is True
 
 
@@ -346,7 +346,7 @@ def test_delete_codex_provider_removes_saved_provider(tmp_path: Path) -> None:
     service.add_codex_provider(
         label="relay",
         model="gpt-5.4",
-        base_url="https://relay.example/v1",
+        base_url="https://provider.example.invalid/v1",
         api_key="secret-token",
     )
 
@@ -374,7 +374,7 @@ def test_delete_codex_provider_rejects_provider_in_use(tmp_path: Path) -> None:
     service.add_codex_provider(
         label="relay",
         model="gpt-5.4",
-        base_url="https://relay.example/v1",
+        base_url="https://provider.example.invalid/v1",
         api_key="secret-token",
     )
     service.switch_chat_codex_provider(7, "relay")
@@ -393,7 +393,7 @@ def test_switch_chat_codex_provider_updates_current_session(tmp_path: Path) -> N
     service.add_codex_provider(
         label="relay",
         model="gpt-5.4",
-        base_url="https://relay.example/v1",
+        base_url="https://provider.example.invalid/v1",
         api_key="secret-token",
     )
 
@@ -433,22 +433,22 @@ def test_switch_chat_claude_provider_reinjects_provider_on_restore(tmp_path: Pat
     service = _build_service(tmp_path, codex_backend, claude_backend=claude_backend)
     service.switch_chat_backend(7, "claude_code_cli_session")
     service.add_claude_code_provider(
-        label="doubao",
+        label="provider-a",
         model="demo-model",
         base_url="https://example.invalid/api/coding",
         api_key="secret-token",
     )
 
-    status = service.switch_chat_claude_code_provider(7, "doubao")
+    status = service.switch_chat_claude_code_provider(7, "provider-a")
 
     backend_status = status["backend_status"]
-    assert backend_status["provider_label"] == "doubao"
+    assert backend_status["provider_label"] == "provider-a"
     assert backend_status["provider_model"] == "demo-model"
     assert backend_status["provider_base_url"] == "https://example.invalid/api/coding"
     assert claude_backend.sessions[status["session_id"]]["provider_api_key"] == "secret-token"
     stored = service.db.get_session(status["session_id"])
     assert stored is not None
-    assert stored["backend_state"]["provider_label"] == "doubao"
+    assert stored["backend_state"]["provider_label"] == "provider-a"
 
 
 def test_switch_chat_codex_provider_can_return_to_default(tmp_path: Path) -> None:
@@ -457,7 +457,7 @@ def test_switch_chat_codex_provider_can_return_to_default(tmp_path: Path) -> Non
     service.add_codex_provider(
         label="relay",
         model="gpt-5.4",
-        base_url="https://relay.example/v1",
+        base_url="https://provider.example.invalid/v1",
         api_key="secret-token",
     )
     service.switch_chat_codex_provider(7, "relay")
@@ -479,7 +479,7 @@ def test_reset_chat_session_preserves_provider_selection(tmp_path: Path) -> None
     service.add_codex_provider(
         label="relay",
         model="gpt-5.4",
-        base_url="https://relay.example/v1",
+        base_url="https://provider.example.invalid/v1",
         api_key="secret-token",
     )
     service.switch_chat_codex_provider(7, "relay")
@@ -528,21 +528,21 @@ def test_switch_chat_claude_code_provider_updates_current_session(tmp_path: Path
     service = _build_service(tmp_path, codex_backend, claude_backend=claude_backend)
     service.switch_chat_backend(7, "claude_code_cli_session")
     service.add_claude_code_provider(
-        label="doubao",
-        model="doubao-seed-code-preview-latest",
+        label="provider-a",
+        model="provider-model-v1",
         base_url="http://127.0.0.1:18080",
         api_key="secret-token",
     )
 
-    status = service.switch_chat_claude_code_provider(7, "doubao")
+    status = service.switch_chat_claude_code_provider(7, "provider-a")
 
     backend_status = status["backend_status"]
-    assert backend_status["provider_label"] == "doubao"
-    assert backend_status["provider_model"] == "doubao-seed-code-preview-latest"
+    assert backend_status["provider_label"] == "provider-a"
+    assert backend_status["provider_model"] == "provider-model-v1"
     assert backend_status["provider_base_url"] == "http://127.0.0.1:18080"
     stored = service.db.get_session(status["session_id"])
     assert stored is not None
-    assert stored["backend_state"]["provider_label"] == "doubao"
+    assert stored["backend_state"]["provider_label"] == "provider-a"
 
 
 def test_switch_chat_claude_code_provider_can_return_to_empty_default(tmp_path: Path) -> None:
@@ -551,12 +551,12 @@ def test_switch_chat_claude_code_provider_can_return_to_empty_default(tmp_path: 
     service = _build_service(tmp_path, codex_backend, claude_backend=claude_backend)
     service.switch_chat_backend(7, "claude_code_cli_session")
     service.add_claude_code_provider(
-        label="doubao",
-        model="doubao-seed-code-preview-latest",
+        label="provider-a",
+        model="provider-model-v1",
         base_url="http://127.0.0.1:18080",
         api_key="secret-token",
     )
-    service.switch_chat_claude_code_provider(7, "doubao")
+    service.switch_chat_claude_code_provider(7, "provider-a")
 
     status = service.switch_chat_claude_code_provider(7, "default")
 
@@ -576,20 +576,20 @@ def test_new_claude_session_uses_configured_default_provider(tmp_path: Path) -> 
         tmp_path,
         codex_backend,
         claude_backend=claude_backend,
-        default_claude_code_provider_label="doubao",
+        default_claude_code_provider_label="provider-a",
     )
     service.add_claude_code_provider(
-        label="doubao",
-        model="doubao-seed-2.0-code",
-        base_url="https://ark.cn-beijing.volces.com/api/coding",
+        label="provider-a",
+        model="provider-model-v2",
+        base_url="https://provider.example.invalid/v1",
         api_key="secret-token",
     )
 
     status = service.switch_chat_backend(7, "claude_code_cli_session")
 
-    assert status["backend_status"]["provider_label"] == "doubao"
-    assert status["backend_status"]["provider_model"] == "doubao-seed-2.0-code"
-    assert status["backend_status"]["provider_base_url"] == "https://ark.cn-beijing.volces.com/api/coding"
+    assert status["backend_status"]["provider_label"] == "provider-a"
+    assert status["backend_status"]["provider_model"] == "provider-model-v2"
+    assert status["backend_status"]["provider_base_url"] == "https://provider.example.invalid/v1"
 
 
 def test_switch_chat_session_rebinds_current_mapping(tmp_path: Path) -> None:
