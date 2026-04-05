@@ -36,3 +36,6 @@ class CodexBackend(ABC):
 
     def cancel_running_reply(self, session_id: str) -> dict:
         return {"ok": False, "reason": "unsupported"}
+
+    def set_session_provider(self, session_id: str, provider: dict | None) -> dict:
+        raise ValueError("Provider switching is not supported for this backend")

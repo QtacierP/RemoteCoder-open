@@ -24,6 +24,8 @@ _BULLET_RE = re.compile(r"^[-*•]\s+(?P<body>.+)$")
 _LOCAL_LINK_LINE_RE = re.compile(r"L(?P<line>\d+)(?:C(?P<col>\d+))?$")
 _LOCAL_LINK_TOKEN_RE = re.compile(r"\[(?P<label>[^\]]+)\]\((?P<target>/[^)]+)\)")
 _CODE_LANG_RE = re.compile(r"[^A-Za-z0-9_+#.-]+")
+_REPLY_HEADER = "*Coder Reply*"
+_REPLY_CONT_HEADER = "*Coder Reply \\(cont\\.\\)*"
 
 
 def _mask_token(token: str) -> str:
@@ -594,7 +596,7 @@ class TelegramAdapter:
     def _render_codex_reply_messages(self, body: str) -> list[str]:
         body = (body or "").strip()
         if not body:
-            return ["*Codex Reply*\n`(empty)`"]
+            return [f"{_REPLY_HEADER}\n`(empty)`"]
 
         blocks: list[str] = []
         cursor = 0
@@ -609,16 +611,16 @@ class TelegramAdapter:
         blocks.extend(self._render_codex_prose_blocks(body[cursor:]))
 
         messages: list[str] = []
-        current = "*Codex Reply*"
+        current = _REPLY_HEADER
         for block in blocks:
-            if self._is_section_boundary(block) and current != "*Codex Reply*":
+            if self._is_section_boundary(block) and current != _REPLY_HEADER:
                 messages.append(current)
-                current = "*Codex Reply*"
+                current = _REPLY_HEADER
             candidate = f"{current}\n\n{block}" if current else block
             if len(candidate) <= self.chunk_size:
                 current = candidate
                 continue
-            if current and current != "*Codex Reply*":
+            if current and current != _REPLY_HEADER:
                 messages.append(current)
             current = block
             if len(current) > self.chunk_size and current.startswith("```"):
@@ -626,12 +628,12 @@ class TelegramAdapter:
                 code_body = rest.removesuffix("\n```")
                 lang = self._normalize_code_language(header.removeprefix("```"))
                 for idx, chunk in enumerate(self._chunk_code_block(code_body), start=1):
-                    prefix = "*Codex Reply*\n\n" if idx == 1 else "*Codex Reply \\(cont\\.\\)*\n\n"
+                    prefix = f"{_REPLY_HEADER}\n\n" if idx == 1 else f"{_REPLY_CONT_HEADER}\n\n"
                     messages.append(f"{prefix}{self._render_code_block(chunk, lang)}")
                 current = ""
         if current:
             messages.append(current)
-        return messages or ["*Codex Reply*\n`(empty)`"]
+        return messages or [f"{_REPLY_HEADER}\n`(empty)`"]
 
     def _render_codex_prose_blocks(self, prose: str) -> list[str]:
         lines = prose.splitlines()

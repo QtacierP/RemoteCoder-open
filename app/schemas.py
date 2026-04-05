@@ -19,7 +19,7 @@ class TelegramInboundMessage(BaseModel):
 class SessionRecord(BaseModel):
     session_id: str
     chat_id: int
-    integration_mode: Literal["codex_cli_session", "codex_sdk"]
+    integration_mode: Literal["codex_cli_session", "codex_sdk", "claude_code_cli_session"]
     workspace_path: str
     status: str
     created_at: datetime

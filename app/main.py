@@ -14,6 +14,7 @@ from app.adapters.telegram import TelegramAdapter
 from app.codex.base import CodexReplyCancelled
 from app.api.routes import router
 from app.codex.cli_session import CodexCliSessionBackend
+from app.codex.claude_code import ClaudeCodeSessionBackend
 from app.codex.sdk_mode import CodexSdkBackend
 from app.config import settings
 from app.db import Database
@@ -21,6 +22,13 @@ from app.logging import configure_logging
 from app.schemas import TelegramInboundMessage
 from app.services.audit_service import AuditService
 from app.services.conversation_history import ConversationHistoryService
+from app.services.claude_proxy_service import ClaudeCodeProxyService
+from app.services.restart_service import (
+    SERVICE_RESTART_DELAY_SECONDS,
+    SERVICE_UNIT_NAME,
+    build_restart_command,
+    build_user_systemd_env,
+)
 from app.services.session_service import SessionService
 from app.services.shell_service import ShellService
 from app.services.workspace_guard import WorkspaceGuard
@@ -30,6 +38,77 @@ configure_logging(
     debug=settings.telegram_debug_mode or settings.codex_debug_mode,
 )
 logger = logging.getLogger(__name__)
+
+
+def normalize_command_alias(text: str) -> str:
+    raw = (text or "").strip()
+    if not raw.startswith("/"):
+        return text
+    parts = raw.split()
+    if not parts:
+        return text
+    head = parts[0].lower()
+    tail = parts[1:]
+
+    def _join(cmd: str, rest: list[str]) -> str:
+        return " ".join([cmd, *rest]).strip()
+
+    if head == "/backend":
+        return _join("/coder_backend", tail)
+    if (head == "/restart" and tail[:1] == ["service"]) or (head == "/service" and tail[:1] == ["restart"]):
+        return _join("/restart_service", tail[1:])
+    if head == "/session" and tail[:1] == ["clear"]:
+        return _join("/session_clear", tail[1:])
+    if head == "/session" and tail[:1] == ["delete"]:
+        return _join("/session_delete", tail[1:])
+    if head == "/cmd" and tail[:2] == ["bg", "all"]:
+        return _join("/cmd_bg_all", tail[2:])
+    if head == "/cmd" and tail[:2] == ["job", "all"]:
+        return _join("/cmd_job_all", tail[2:])
+    if head == "/cmd" and tail[:2] == ["bg", "delete"]:
+        return _join("/cmd_bg_delete", tail[2:])
+    if head == "/cmd" and tail[:2] == ["bg", "clear"]:
+        return _join("/cmd_bg_clear", tail[2:])
+    if head == "/cmd" and tail[:1] == ["bg"]:
+        return _join("/cmd_bg", tail[1:])
+    if head == "/cmd" and tail[:2] == ["stop", "all"]:
+        return _join("/cmd_stop_all", tail[2:])
+    if head == "/cmd" and tail[:1] == ["stop"]:
+        return _join("/cmd_stop", tail[1:])
+    if head == "/cmd" and tail[:1] == ["status"]:
+        return _join("/cmd_status", tail[1:])
+    if head == "/cmd" and tail[:1] == ["jobs"]:
+        return _join("/cmd_jobs", tail[1:])
+    if head == "/cmd" and tail[:1] == ["reset"]:
+        return _join("/cmd_reset", tail[1:])
+    if head == "/cmd" and tail[:1] == ["top"]:
+        return _join("/cmd_top", tail[1:])
+    if head == "/conda" and tail[:1] == ["envs"]:
+        return _join("/conda_envs", tail[1:])
+    if head == "/conda" and tail[:1] == ["off"]:
+        return _join("/conda_off", tail[1:])
+    if head == "/git" and tail[:1] and tail[0] in {"add", "commit", "show", "push", "status", "diff", "log", "branch"}:
+        return _join(f"/git_{tail[0]}", tail[1:])
+    if head == "/trace" and tail[:1] == ["raw"]:
+        return _join("/trace_raw", tail[1:])
+    if head == "/trace" and tail[:1] == ["error"]:
+        return _join("/trace_error", tail[1:])
+    if head == "/codex" and tail[:2] and tail[:2] in (["api", "add"], ["api", "delete"], ["api", "list"], ["api", "switch"]):
+        return _join(f"/codex_api_{tail[1]}", tail[2:])
+    if head == "/codex" and tail[:1] == ["proxy"]:
+        return _join("/codex_proxy", tail[1:])
+    if head in {"/claude", "/claude_code", "/claude-code"} and tail[:2] and tail[:2] in (
+        ["api", "add"],
+        ["api", "delete"],
+        ["api", "list"],
+        ["api", "switch"],
+    ):
+        return _join(f"/claude_code_api_{tail[1]}", tail[2:])
+    if head in {"/claude", "/claude_code", "/claude-code"} and tail[:1] == ["proxy"]:
+        return _join("/claude_code_proxy", tail[1:])
+    if head == "/context" and tail[:1] == ["handoff"]:
+        return _join("/context_handoff", tail[1:])
+    return raw
 
 
 def build_app() -> FastAPI:
@@ -51,6 +130,13 @@ def build_app() -> FastAPI:
             debug_mode=settings.codex_debug_mode,
             web_search_enabled=settings.codex_web_search_enabled,
         ),
+        "claude_code_cli_session": ClaudeCodeSessionBackend(
+            claude_bin=settings.claude_code_bin,
+            claude_args=settings.claude_code_cli_args,
+            thinking_mode=settings.claude_code_thinking_mode,
+            timeout_seconds=settings.codex_message_timeout_seconds,
+            proxy_url=settings.claude_code_effective_proxy_url,
+        ),
         "codex_sdk": CodexSdkBackend(),
     }
 
@@ -60,8 +146,17 @@ def build_app() -> FastAPI:
         workspace_guard=workspace_guard,
         backends=backends,
         default_mode=settings.default_codex_mode,
+        default_claude_code_provider_label=settings.default_claude_code_provider_label,
     )
     conversation_history = ConversationHistoryService(settings.conversation_history_dir)
+    claude_proxy_service = ClaudeCodeProxyService(
+        enabled=settings.claude_code_proxy_enabled,
+        listen_host=settings.claude_code_proxy_host,
+        listen_port=settings.claude_code_proxy_port,
+        upstream_base=settings.claude_code_proxy_upstream_base,
+        upstream_key=settings.claude_code_proxy_upstream_key,
+        proxy_url=settings.shared_effective_proxy_url,
+    )
     shell_service = ShellService(
         settings.default_workspace,
         timeout_seconds=settings.codex_message_timeout_seconds,
@@ -81,12 +176,36 @@ def build_app() -> FastAPI:
     app.state.shell_service = shell_service
     app.state.telegram = telegram
     app.state.conversation_history = conversation_history
+    app.state.claude_proxy_service = claude_proxy_service
     app.state.telegram_offset = None
     app.state.poll_task = None
     app.state.shell_notify_task = None
+    app.state.service_restart_task = None
     app.state.active_chats = set()
     app.state.chat_locks = {}
     app.state.update_tasks = set()
+
+    def _runtime_proxy_url(mode: str) -> str | None:
+        backend = backends[mode]
+        raw = getattr(backend, "proxy_url", None)
+        if not isinstance(raw, str):
+            return None
+        value = raw.strip()
+        return value or None
+
+    def _runtime_proxy_enabled(mode: str) -> bool:
+        return _runtime_proxy_url(mode) is not None
+
+    def _set_runtime_proxy(mode: str, enabled: bool) -> str | None:
+        backend = backends[mode]
+        if enabled:
+            proxy_url = settings.shared_effective_proxy_url
+            if not proxy_url:
+                raise ValueError("Shared proxy is not configured.")
+            backend.proxy_url = proxy_url
+            return proxy_url
+        backend.proxy_url = None
+        return None
 
     def _is_session_reset_command(text: str) -> bool:
         command = text.split(maxsplit=1)[0].lower()
@@ -121,19 +240,36 @@ def build_app() -> FastAPI:
         return filtered
 
     def _is_local_bypass_command(text: str) -> bool:
-        command = text.split(maxsplit=1)[0].lower()
+        command = normalize_command_alias(text).split(maxsplit=1)[0].lower()
         return command in {
             "/status",
             "/trace",
             "/trace_raw",
+            "/trace_error",
             "/cancel",
             "/help",
+            "/resend",
             "/pwd",
             "/mode",
             "/debug",
+            "/restart_service",
             "/workspace",
             "/workspaces",
+            "/session",
+            "/session_clear",
+            "/session_delete",
             "/session_label",
+            "/codex_api_add",
+            "/codex_api_delete",
+            "/codex_api_list",
+            "/codex_api_switch",
+            "/codex_proxy",
+            "/claude_code_api_add",
+            "/claude_code_api_delete",
+            "/claude_code_api_list",
+            "/claude_code_api_switch",
+            "/claude_code_proxy",
+            "/coder_backend",
             "/git_add",
             "/git_commit",
             "/git_show",
@@ -154,6 +290,10 @@ def build_app() -> FastAPI:
             "/gpu",
             "/cmd",
             "/cmd_bg",
+            "/cmd_bg_all",
+            "/cmd_job_all",
+            "/cmd_bg_delete",
+            "/cmd_bg_clear",
             "/cmd_jobs",
             "/cmd_stop",
             "/cmd_stop_all",
@@ -171,6 +311,7 @@ def build_app() -> FastAPI:
         return lock
 
     async def _process_single_update(normalized: TelegramInboundMessage, source: str) -> None:
+        effective_text = normalize_command_alias(normalized.text)
         logger.info(
             "processing telegram update",
             extra={
@@ -192,7 +333,7 @@ def build_app() -> FastAPI:
                 "update stage=handle_chat_text start",
                 extra={"update_id": normalized.update_id, "chat_id": normalized.chat_id},
             )
-            reply = await handle_chat_text(normalized.chat_id, normalized.text)
+            reply = await handle_chat_text(normalized.chat_id, effective_text)
             t1 = asyncio.get_running_loop().time()
             logger.debug(
                 "update stage=handle_chat_text done",
@@ -213,12 +354,15 @@ def build_app() -> FastAPI:
                     extra={"update_id": normalized.update_id, "chat_id": normalized.chat_id},
                 )
                 return reply
-            if _is_local_bypass_command(normalized.text):
-                markdown = _render_local_markdown(normalized.text, reply)
-                if markdown is not None:
-                    await telegram.send_markdown(normalized.chat_id, markdown)
+            if _is_local_bypass_command(effective_text):
+                if effective_text.split(maxsplit=1)[0].lower() == "/resend":
+                    await telegram.send_codex_reply(normalized.chat_id, reply)
                 else:
-                    await telegram.send_markdown_card(normalized.chat_id, normalized.text[:80], reply)
+                    markdown = _render_local_markdown(effective_text, reply)
+                    if markdown is not None:
+                        await telegram.send_markdown(normalized.chat_id, markdown)
+                    else:
+                        await telegram.send_markdown_card(normalized.chat_id, effective_text[:80], reply)
             else:
                 await telegram.send_codex_reply(normalized.chat_id, reply)
             t2 = asyncio.get_running_loop().time()
@@ -233,7 +377,7 @@ def build_app() -> FastAPI:
             )
             return reply
 
-        if _is_local_bypass_command(normalized.text):
+        if _is_local_bypass_command(effective_text):
             await _run()
             return
 
@@ -370,6 +514,7 @@ def build_app() -> FastAPI:
                 return None
             categories: list[tuple[str, list[tuple[str, str]]]] = [
                 ("Session", []),
+                ("Backend", []),
                 ("Git", []),
                 ("Files", []),
                 ("Media", []),
@@ -377,23 +522,48 @@ def build_app() -> FastAPI:
                 ("System", []),
             ]
             def _bucket(name: str) -> list[tuple[str, str]]:
-                if name in {"/new", "/reset", "/status", "/workspace", "/workspaces", "/session_label", "/pwd", "/mode"}:
+                lowered = name.lower()
+                if lowered.startswith("/session") or lowered in {
+                    "/new",
+                    "/reset",
+                    "/status",
+                    "/workspace",
+                    "/workspaces",
+                    "/pwd",
+                    "/mode",
+                    "/backend",
+                }:
                     return categories[0][1]
-                if name in {"/trace", "/trace_raw"}:
-                    return categories[0][1]
-                if name == "/cancel":
-                    return categories[0][1]
-                if name == "/timeout":
-                    return categories[0][1]
-                if name.startswith("/git_"):
+                if lowered in {
+                    "/codex api add",
+                    "/codex api delete",
+                    "/codex api list",
+                    "/codex api switch",
+                    "/codex proxy",
+                    "/claude api add",
+                    "/claude api delete",
+                    "/claude api list",
+                    "/claude api switch",
+                    "/claude proxy",
+                }:
                     return categories[1][1]
-                if name in {"/ls", "/tree", "/read", "/tail", "/find", "/grep"}:
+                if lowered.startswith("/trace"):
+                    return categories[1][1]
+                if lowered == "/cancel":
+                    return categories[1][1]
+                if lowered == "/timeout":
+                    return categories[1][1]
+                if lowered == "/context_handoff":
+                    return categories[1][1]
+                if lowered.startswith("/git "):
                     return categories[2][1]
-                if name in {"/show", "/download"}:
+                if lowered in {"/ls", "/tree", "/read", "/tail", "/find", "/grep"}:
                     return categories[3][1]
-                if name.startswith("/cmd") or name in {"/log", "/watch"}:
+                if lowered in {"/show", "/download"}:
                     return categories[4][1]
-                return categories[5][1]
+                if lowered.startswith("/cmd") or lowered in {"/log", "/watch", "/conda", "/conda envs", "/conda off"}:
+                    return categories[5][1]
+                return categories[6][1]
             for line in lines[1:]:
                 if " - " in line:
                     name, desc = line.split(" - ", 1)
@@ -426,6 +596,8 @@ def build_app() -> FastAPI:
                 headline_bits.append(_status_chip("session", kv["session_status"]))
             if "mode" in kv:
                 headline_bits.append(_status_chip("mode", kv["mode"]))
+            if "provider_label" in kv:
+                headline_bits.append(_status_chip("provider", kv["provider_label"]))
             if headline_bits:
                 blocks.append(" ".join(headline_bits))
             meta_lines: list[str] = []
@@ -437,10 +609,14 @@ def build_app() -> FastAPI:
                 meta_lines.append(_inline_kv("session", kv["session_id"]))
             if "timeout_seconds" in kv:
                 meta_lines.append(_inline_kv("timeout", kv["timeout_seconds"]))
+            if "context_handoff" in kv:
+                meta_lines.append(_inline_kv("context_handoff", kv["context_handoff"]))
+            if "provider_model" in kv and kv["provider_model"] not in {"", "(codex default)", "(empty)"}:
+                meta_lines.append(_inline_kv("provider_model", kv["provider_model"]))
             if meta_lines:
                 blocks.append("")
                 blocks.extend(meta_lines)
-            for key in ["session_label", "reply_state", "session_status", "mode"]:
+            for key in ["session_label", "reply_state", "session_status", "mode", "provider_label", "provider_model"]:
                 kv.pop(key, None)
             if "workspace" in kv:
                 blocks.append("")
@@ -508,6 +684,22 @@ def build_app() -> FastAPI:
                     blocks.append(_bullet_code(item))
             if len(blocks) == 1:
                 blocks.append(_bullet_text("No workspace details available."))
+            return "\n".join(blocks)
+
+        if cmd == "/session":
+            blocks = [_title("Sessions")]
+            current_session_id = kv.get("current_session_id")
+            current_workspace = kv.get("current_workspace")
+            if current_session_id:
+                blocks.append(_inline_kv("current_session", current_session_id))
+            if current_workspace:
+                blocks.append(_inline_kv("current_workspace", current_workspace))
+            if extra:
+                lines = [line.strip() for line in extra.splitlines() if line.strip()]
+                if lines:
+                    blocks.append("")
+                    blocks.append(_section("History"))
+                    blocks.extend(_bullet_code(line) for line in lines)
             return "\n".join(blocks)
 
         if cmd in {"/cmd_status", "/cmd_jobs", "/log", "/watch"}:
@@ -586,8 +778,13 @@ def build_app() -> FastAPI:
                     blocks.append(_code_block(extra))
             return "\n".join(blocks)
 
-        if cmd in {"/trace", "/trace_raw"}:
-            title = _title("Codex Trace") if cmd == "/trace" else _title("Codex Trace Raw")
+        if cmd in {"/trace", "/trace_raw", "/trace_error"}:
+            title_map = {
+                "/trace": _title("Backend Trace"),
+                "/trace_raw": _title("Backend Trace Raw"),
+                "/trace_error": _title("Backend Error Trace"),
+            }
+            title = title_map[cmd]
             blocks = [title]
             for key in [
                 "running",
@@ -718,7 +915,7 @@ def build_app() -> FastAPI:
 
     async def handle_chat_text(chat_id: int, text: str) -> str:
         if text.startswith("/"):
-            return await handle_command(chat_id, text)
+            return await handle_command(chat_id, normalize_command_alias(text))
         try:
             app.state.active_chats.add(chat_id)
             logger.debug("chat pipeline stage=session_send start", extra={"chat_id": chat_id, "text_len": len(text)})
@@ -730,9 +927,10 @@ def build_app() -> FastAPI:
                 chat_id=chat_id,
                 session_id=session["session_id"],
                 user_text=text,
-                codex_raw_stream=output,
+                backend_raw_stream=output,
                 telegram_reply=reply,
             )
+            await asyncio.to_thread(session_service.mark_last_good_session, session["session_id"])
             elapsed_ms = int((asyncio.get_running_loop().time() - started) * 1000)
             logger.debug(
                 "chat pipeline stage=session_send done",
@@ -747,11 +945,11 @@ def build_app() -> FastAPI:
             )
             return reply
         except CodexReplyCancelled:
-            logger.info("codex reply cancelled", extra={"chat_id": chat_id})
+            logger.info("backend reply cancelled", extra={"chat_id": chat_id})
             return ""
         except Exception as exc:  # noqa: BLE001
             logger.exception("failed handling chat message")
-            return f"Error talking to Codex backend: {exc}"
+            return f"Error talking to coder backend: {exc}"
         finally:
             app.state.active_chats.discard(chat_id)
 
@@ -761,6 +959,9 @@ def build_app() -> FastAPI:
         arg = parts[1].strip().lower() if len(parts) > 1 else ""
         session = session_service.get_chat(chat_id)
         command_workspace = settings.default_workspace if session is None else session["workspace_path"]
+
+        def _shell_session() -> dict:
+            return session_service.get_or_create_chat_session(chat_id)
 
         def _shell_status_text(status: dict) -> str:
             return (
@@ -772,6 +973,76 @@ def build_app() -> FastAPI:
                 f"active_jobs: {len(status.get('active_job_ids', []))}\n"
                 f"latest_job_id: {status.get('latest_job_id')}"
             )
+
+        def _backend_alias_to_mode(raw_mode: str) -> str:
+            normalized = raw_mode.strip().lower()
+            mapping = {
+                "codex": "codex_cli_session",
+                "codex_cli_session": "codex_cli_session",
+                "claude_code": "claude_code_cli_session",
+                "claude": "claude_code_cli_session",
+                "claude_code_cli_session": "claude_code_cli_session",
+            }
+            if normalized not in mapping:
+                raise ValueError(f"Unknown backend: {raw_mode}")
+            return mapping[normalized]
+
+        def _mode_display_name(mode: str) -> str:
+            if mode == "claude_code_cli_session":
+                return "Claude Code"
+            if mode == "codex_cli_session":
+                return "Codex"
+            return mode
+
+        def _provider_default_values(mode: str) -> tuple[str, str]:
+            if mode == "claude_code_cli_session":
+                provider = session_service._configured_default_provider_record(mode)
+                if provider is not None:
+                    return str(provider["model"]), str(provider["base_url"])
+                return "(empty)", "(empty)"
+            return "(codex default)", "(official)"
+
+        def _provider_switch_warning(mode: str, backend_status: dict) -> str:
+            if mode != "claude_code_cli_session":
+                return ""
+            if session_service._configured_default_provider_record(mode) is not None:
+                return ""
+            if (backend_status.get("provider_label") or "default") != "default":
+                return ""
+            return (
+                "\nwarning: claude code default provider is empty.\n"
+                "Add one with /claude_code_api_add <label> :: <model> :: <base_url> :: <api_key>\n"
+                "Then switch with /claude_code_api_switch <label>"
+            )
+
+        async def _restart_service_later(delay_seconds: float = SERVICE_RESTART_DELAY_SECONDS) -> None:
+            await asyncio.sleep(delay_seconds)
+            cmd = build_restart_command()
+            env = build_user_systemd_env()
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    env=env,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, stderr = await proc.communicate()
+            except Exception:  # noqa: BLE001
+                logger.exception("failed launching user systemd restart", extra={"chat_id": chat_id, "cmd": cmd})
+                return
+            if proc.returncode != 0:
+                logger.error(
+                    "user systemd restart command failed",
+                    extra={
+                        "chat_id": chat_id,
+                        "cmd": cmd,
+                        "return_code": proc.returncode,
+                        "stdout": (stdout or b"").decode(errors="ignore")[-800:],
+                        "stderr": (stderr or b"").decode(errors="ignore")[-800:],
+                    },
+                )
+                return
+            logger.warning("user systemd restart command completed", extra={"chat_id": chat_id, "cmd": cmd})
 
         def _parse_tail_and_job(raw: str) -> tuple[int | None, int]:
             if not raw:
@@ -838,62 +1109,151 @@ def build_app() -> FastAPI:
                 return f"Failed to send file: {exc}"
             return f"Sent file: {target}"
 
+        def _build_context_handoff(source_session: dict, *, reason: str, target_mode: str, target_provider_label: str | None = None) -> str:
+            source_status = session_service.get_session_status(source_session["session_id"])
+            backend_status = source_status.get("backend_status", {})
+            recent_turns = conversation_history.list_recent_turns(
+                chat_id=chat_id,
+                session_id=source_session["session_id"],
+                limit=3,
+            )
+            lines = [
+                "[Context Handoff]",
+                "[Session Summary]",
+                f"reason={reason}",
+                f"source_mode={source_session['integration_mode']}",
+                f"target_mode={target_mode}",
+                f"workspace={source_session['workspace_path']}",
+                f"session_label={source_session.get('label') or '(none)'}",
+                f"provider_label={backend_status.get('provider_label') or 'default'}",
+                f"provider_model={backend_status.get('provider_model') or '(default)'}",
+            ]
+            if target_provider_label:
+                lines.append(f"target_provider_label={target_provider_label}")
+            latest_reply = conversation_history.read_latest_reply(chat_id=chat_id, session_id=source_session["session_id"])
+            if latest_reply and latest_reply != "(No transcript reply available.)":
+                lines.extend(["", "[Latest Assistant Reply]", latest_reply[:1600]])
+            if recent_turns:
+                lines.extend(["", "[Recent Turns]"])
+                for idx, turn in enumerate(recent_turns, start=1):
+                    user_text = (turn.get("user_text") or "").strip() or "(none)"
+                    reply_text = (turn.get("telegram_reply") or "").strip() or "(none)"
+                    lines.append(f"[Turn {idx}]")
+                    lines.append("[User]")
+                    lines.append(user_text[:800])
+                    lines.append("[Assistant]")
+                    lines.append(reply_text[:800])
+            lines.extend(["", "[End Context Handoff]"])
+            return "\n".join(lines).strip()
+
         if cmd == "/help":
             return (
                 "Available commands:\n"
-                "/new - create a new session\n"
+                "\n"
+                "Session commands:\n"
+                "/new [label] - create a new session, optionally with a label\n"
                 "/reset - reset current session\n"
                 "/status [verbose] - show current session status\n"
-                "/workspace [path] [:: label] - show or switch the current Codex workspace\n"
+                "/workspace [path] [:: label] - show or switch the current workspace\n"
                 "/workspaces - list allowed workspace roots\n"
-                "/session_label <label> - update the current Codex session label\n"
-                "/trace [n] - show recent Codex event summaries for the current session\n"
-                "/trace_raw [n] - show recent raw Codex JSONL event lines\n"
-                "/cancel - stop the current Codex reply for this chat\n"
-                "/timeout [seconds] - show or set the current Codex reply timeout\n"
-                "/git_add <path> - stage a file or directory\n"
-                "/git_commit <message> - create a commit from staged changes\n"
-                "/git_show [ref] - show a commit with stats\n"
-                "/git_push [remote] [branch] - push current branch to remote\n"
-                "/git_status - show git branch and working tree status\n"
-                "/git_diff [path] - show git diff, optionally for one path\n"
-                "/git_log [n] - show recent commits\n"
-                "/git_branch - show local branches\n"
+                "/session list - list this chat's sessions\n"
+                "/session <session_id|tag> - switch to a session\n"
+                "/session label <tag> - update the current session tag\n"
+                "/session clear - clear this chat's sessions and create a fresh one\n"
+                "/session delete <session_id|tag> - delete a specific non-current session\n"
+                "/pwd - show current workspace\n"
+                "/mode - show integration mode\n"
+                "\n"
+                "Backend commands:\n"
+                "/backend <codex|claude_code> - switch the current backend and keep the same workspace\n"
+                "/codex api add <label> :: <model> :: <base_url> :: <api_key> - add or update a Codex API provider\n"
+                "/codex api delete <label> - delete a saved Codex API provider when no session is using it\n"
+                "/codex api list - list available Codex API providers\n"
+                "/codex api switch <label|default> - switch the current session's Codex provider\n"
+                "/codex proxy [on|off] - show or toggle whether Codex uses the shared proxy\n"
+                "/claude api add <label> :: <model> :: <base_url> :: <api_key> - add or update a Claude Code provider\n"
+                "/claude api delete <label> - delete a saved Claude Code provider when no session is using it\n"
+                "/claude api list - list available Claude Code providers\n"
+                "/claude api switch <label|default> - switch the current session's Claude Code provider\n"
+                "/claude proxy [on|off] - show or toggle whether Claude Code uses the shared proxy\n"
+                "/trace [n] - show recent backend event summaries for the current session\n"
+                "/trace raw [n] - show recent raw backend event lines\n"
+                "/trace error [n] - show the most recent backend error context\n"
+                "/cancel - stop the current backend reply for this chat\n"
+                "/resend [n] - resend the nth most recent reply from the current session\n"
+                "/timeout [seconds] - show or set the current reply timeout\n"
+                "/context_handoff [off|light] - show or set cross-switch context handoff for this session\n"
+                "\n"
+                "Git commands:\n"
+                "/git add <path> - stage a file or directory\n"
+                "/git commit <message> - create a commit from staged changes\n"
+                "/git show [ref] - show a commit with stats\n"
+                "/git push [remote] [branch] - push current branch to remote\n"
+                "/git status - show git branch and working tree status\n"
+                "/git diff [path] - show git diff, optionally for one path\n"
+                "/git log [n] - show recent commits\n"
+                "/git branch - show local branches\n"
+                "\n"
+                "File commands:\n"
                 "/ls [path] - list files in the current workspace\n"
                 "/tree [path] [depth] - show a truncated directory tree\n"
                 "/read <path> [start_line] [lines] - read part of a text file\n"
                 "/tail <path> [lines] - tail a text file\n"
                 "/find <pattern> [path] - find files by name under the workspace\n"
                 "/grep <pattern> [path] - search text in workspace files\n"
+                "\n"
+                "Media commands:\n"
                 "/show <path> - send an image or file back to Telegram\n"
                 "/download <path> - send a file back to Telegram as a document\n"
-                "/cmd_top - show CPU, memory, disk, and hot processes\n"
+                "\n"
+                "Shell commands:\n"
+                "/cmd top - show CPU, memory, disk, and hot processes\n"
                 "/gpu - show GPU status from nvidia-smi\n"
                 "/cmd <command> - run a direct shell command in a persistent per-chat shell\n"
-                "/cmd_bg <command> - start a long-running shell job in the background\n"
-                "/conda [env] - show or switch the current conda environment for /cmd and /cmd_bg\n"
-                "/conda_envs - list available conda environments\n"
-                "/conda_off - clear the selected conda environment\n"
-                "/cmd_jobs - list shell background jobs for this chat\n"
-                "/cmd_status [lines] - show shell status and latest job tail\n"
+                "/cmd bg <command> - start a long-running shell job in the background\n"
+                "/cmd bg all - list background jobs across all sessions\n"
+                "/cmd bg delete <job_id> - delete one background shell job and its log\n"
+                "/cmd bg clear - delete all background shell jobs and logs for this chat\n"
+                "/conda [env] - show or switch the current conda environment for shell commands\n"
+                "/conda envs - list available conda environments\n"
+                "/conda off - clear the selected conda environment\n"
+                "/cmd jobs - list shell background jobs for this chat\n"
+                "/cmd status [lines] - show shell status and latest job tail\n"
                 "/log [job_id] [lines] - tail a shell job log\n"
                 "/watch [job_id] [lines] [:: kw1,kw2] - show filtered training progress lines from a shell job log\n"
-                "/cmd_stop <job_id> - stop a background shell job\n"
-                "/cmd_stop_all - stop all background shell jobs for this chat\n"
-                "/cmd_reset - reset the per-chat shell session\n"
-                "/pwd - show current workspace\n"
-                "/mode - show integration mode\n"
+                "/cmd stop <job_id> - stop a background shell job\n"
+                "/cmd stop all - stop all background shell jobs for this chat\n"
+                "/cmd reset - reset the per-chat shell session\n"
+                "\n"
+                "System commands:\n"
                 "/debug - show Telegram diagnostics summary\n"
                 "/debug verbose - show detailed Telegram diagnostics\n"
-                "/help - this help"
+                "/restart service - restart the RemoteCoder user service after a short delay\n"
+                "/help - this help\n"
+                "Legacy underscore commands still work as aliases."
+            )
+        if cmd == "/restart_service":
+            existing_task = getattr(app.state, "service_restart_task", None)
+            if existing_task and not existing_task.done():
+                return (
+                    "Service restart is already scheduled.\n"
+                    f"unit: {SERVICE_UNIT_NAME}\n"
+                    f"delay_seconds: {int(SERVICE_RESTART_DELAY_SECONDS)}"
+                )
+            app.state.service_restart_task = asyncio.create_task(_restart_service_later())
+            return (
+                "Service restart scheduled.\n"
+                f"unit: {SERVICE_UNIT_NAME}\n"
+                f"delay_seconds: {int(SERVICE_RESTART_DELAY_SECONDS)}\n"
+                "This chat may disconnect during restart."
             )
         if cmd == "/new":
             raw = parts[1].strip() if len(parts) > 1 else ""
-            _, label = _split_with_label(raw)
-            session = session_service.new_session(chat_id=chat_id, label=label)
+            session = session_service.new_session(chat_id=chat_id, label=raw)
             return (
                 f"Created new session {session['session_id']} in {session['workspace_path']}\n"
-                f"label: {session.get('label') or '(none)'}"
+                f"label: {session.get('label') or '(none)'}\n"
+                f"mode: {session['integration_mode']}"
             )
         if cmd == "/reset":
             session = session_service.reset_chat_session(chat_id=chat_id)
@@ -914,7 +1274,7 @@ def build_app() -> FastAPI:
                 if not workspace_arg:
                     return "Usage: /workspace <path> [:: label]"
                 session = session_service.switch_chat_workspace(chat_id, workspace_arg, label or None)
-                await asyncio.to_thread(shell_service.reset, chat_id, session["workspace_path"])
+                await asyncio.to_thread(shell_service.reset, session["session_id"], chat_id, session["workspace_path"])
                 return (
                     f"Switched workspace.\n"
                     f"session_id: {session['session_id']}\n"
@@ -930,25 +1290,328 @@ def build_app() -> FastAPI:
             ]
             lines.extend(str(path) for path in settings.allowed_workspace_paths)
             return "\n".join(lines)
+        if cmd == "/session":
+            raw = parts[1].strip() if len(parts) > 1 else ""
+            if not raw or raw.lower() == "list":
+                current = session_service.get_or_create_chat_session(chat_id)
+                sessions = session_service.list_chat_sessions(chat_id)
+                lines = [
+                    f"current_session_id: {current['session_id']}",
+                    f"current_workspace: {current['workspace_path']}",
+                    "sessions:",
+                ]
+                for item in sessions[:20]:
+                    marker = "*" if item["session_id"] == current["session_id"] else "-"
+                    label = item.get("label") or "(none)"
+                    lines.append(
+                        f"{marker} {item['session_id']} | {item['status']} | {item['integration_mode']} | "
+                        f"{item['workspace_path']} | label={label}"
+                    )
+                if len(sessions) > 20:
+                    lines.append(f"... and {len(sessions) - 20} more")
+                lines.append("Use /session <session_id|tag> to switch.")
+                return "\n".join(lines)
+            if raw.lower().startswith("label "):
+                label = raw[6:].strip()
+                if not label:
+                    return "Usage: /session label <tag>"
+                session = session_service.set_session_label(chat_id, label)
+                return (
+                    "Updated session tag.\n"
+                    f"session_id: {session['session_id']}\n"
+                    f"label: {session.get('label') or '(none)'}"
+                )
+            if raw.lower() == "label":
+                return "Usage: /session label <tag>"
+            try:
+                session = session_service.switch_chat_session(chat_id, raw)
+                shell_sync = await asyncio.to_thread(
+                    shell_service.sync_workspace,
+                    session["session_id"],
+                    chat_id,
+                    session["workspace_path"],
+                )
+            except KeyError:
+                return f"Session or tag not found: {raw}"
+            except Exception as exc:  # noqa: BLE001
+                return str(exc)
+            message = (
+                "Switched current session.\n"
+                f"session_id: {session['session_id']}\n"
+                f"workspace: {session['workspace_path']}\n"
+                f"label: {session.get('label') or '(none)'}\n"
+                f"mode: {session['integration_mode']}"
+            )
+            if not shell_sync.get("workspace_applied"):
+                message += (
+                    f"\nshell_cwd: {shell_sync.get('cwd')}"
+                    "\nnote: shell workspace was kept because background jobs are still active"
+                )
+            return message
+        if cmd == "/session_clear":
+            session = session_service.clear_chat_sessions(chat_id)
+            await asyncio.to_thread(shell_service.reset, session["session_id"], chat_id, session["workspace_path"])
+            return (
+                "Cleared session history and created a fresh session.\n"
+                f"session_id: {session['session_id']}\n"
+                f"workspace: {session['workspace_path']}\n"
+                f"label: {session.get('label') or '(none)'}\n"
+                f"mode: {session['integration_mode']}"
+            )
+        if cmd == "/session_delete":
+            raw = parts[1].strip() if len(parts) > 1 else ""
+            if not raw:
+                return "Usage: /session_delete <session_id|tag>"
+            try:
+                session_service.delete_chat_session(chat_id, raw)
+            except KeyError:
+                return f"Session or tag not found: {raw}"
+            except Exception as exc:  # noqa: BLE001
+                return str(exc)
+            return f"Deleted session: {raw}"
         if cmd == "/session_label":
             raw = parts[1].strip() if len(parts) > 1 else ""
             if not raw:
-                return "Usage: /session_label <label>"
+                return "Usage: /session label <tag>"
             session = session_service.set_session_label(chat_id, raw)
             return (
-                f"Updated session label.\n"
+                f"Updated session tag.\n"
                 f"session_id: {session['session_id']}\n"
                 f"label: {session.get('label') or '(none)'}"
             )
+        if cmd == "/coder_backend":
+            raw = parts[1].strip() if len(parts) > 1 else ""
+            if not raw:
+                session = session_service.get_or_create_chat_session(chat_id)
+                return (
+                    f"backend: {session['integration_mode']}\n"
+                    "available: codex, claude_code"
+                )
+            try:
+                source_session = session_service.get_or_create_chat_session(chat_id)
+                target_mode = _backend_alias_to_mode(raw)
+                status = session_service.switch_chat_backend(chat_id, target_mode)
+                source_status = session_service.get_session_status(source_session["session_id"])
+                if source_status.get("backend_status", {}).get("context_handoff_mode", "light") == "light":
+                    handoff_text = _build_context_handoff(
+                        source_session,
+                        reason="backend_switch",
+                        target_mode=target_mode,
+                    )
+                    session_service.queue_session_context_handoff(status["session_id"], handoff_text)
+                    status = session_service.get_session_status(status["session_id"])
+                shell_sync = await asyncio.to_thread(
+                    shell_service.sync_workspace,
+                    status["session_id"],
+                    chat_id,
+                    status["workspace_path"],
+                )
+            except Exception as exc:  # noqa: BLE001
+                return str(exc)
+            backend_status = status.get("backend_status", {})
+            provider_model_default, provider_base_default = _provider_default_values(target_mode)
+            message = (
+                "Backend switched.\n"
+                f"mode: {status['integration_mode']}\n"
+                f"provider_label: {backend_status.get('provider_label') or 'default'}\n"
+                f"provider_model: {backend_status.get('provider_model') or provider_model_default}\n"
+                f"provider_base_url: {backend_status.get('provider_base_url') or provider_base_default}\n"
+                f"context_handoff: {backend_status.get('context_handoff_mode')}\n"
+                f"context_queued: {'yes' if backend_status.get('pending_context_handoff') else 'no'}"
+            )
+            if not shell_sync.get("workspace_applied"):
+                message += (
+                    f"\nshell_cwd: {shell_sync.get('cwd')}"
+                    "\nnote: shell workspace was kept because background jobs are still active"
+                )
+            return message + _provider_switch_warning(target_mode, backend_status)
+        if cmd == "/codex_api_add":
+            raw = parts[1].strip() if len(parts) > 1 else ""
+            fields = [item.strip() for item in raw.split("::")]
+            if len(fields) != 4 or not all(fields):
+                return "Usage: /codex_api_add <label> :: <model> :: <base_url> :: <api_key>"
+            try:
+                provider = session_service.add_codex_provider(
+                    label=fields[0],
+                    model=fields[1],
+                    base_url=fields[2],
+                    api_key=fields[3],
+                )
+            except Exception as exc:  # noqa: BLE001
+                return str(exc)
+            return (
+                "Codex API provider saved.\n"
+                f"label: {provider['label']}\n"
+                f"model: {provider['model']}\n"
+                f"base_url: {provider['base_url']}"
+            )
+        if cmd == "/claude_code_api_add":
+            raw = parts[1].strip() if len(parts) > 1 else ""
+            fields = [item.strip() for item in raw.split("::")]
+            if len(fields) != 4 or not all(fields):
+                return "Usage: /claude_code_api_add <label> :: <model> :: <base_url> :: <api_key>"
+            try:
+                provider = session_service.add_claude_code_provider(
+                    label=fields[0],
+                    model=fields[1],
+                    base_url=fields[2],
+                    api_key=fields[3],
+                )
+            except Exception as exc:  # noqa: BLE001
+                return str(exc)
+            return (
+                "Claude Code API provider saved.\n"
+                f"label: {provider['label']}\n"
+                f"model: {provider['model']}\n"
+                f"base_url: {provider['base_url']}"
+            )
+        if cmd == "/codex_api_delete":
+            raw = parts[1].strip() if len(parts) > 1 else ""
+            if not raw:
+                return "Usage: /codex_api_delete <label>"
+            try:
+                deleted_label = session_service.delete_codex_provider(raw)
+            except KeyError:
+                return f"Codex provider not found: {raw}"
+            except Exception as exc:  # noqa: BLE001
+                return str(exc)
+            return f"Codex API provider deleted.\nlabel: {deleted_label}"
+        if cmd == "/claude_code_api_delete":
+            raw = parts[1].strip() if len(parts) > 1 else ""
+            if not raw:
+                return "Usage: /claude_code_api_delete <label>"
+            try:
+                deleted_label = session_service.delete_claude_code_provider(raw)
+            except KeyError:
+                return f"Claude Code provider not found: {raw}"
+            except Exception as exc:  # noqa: BLE001
+                return str(exc)
+            return f"Claude Code API provider deleted.\nlabel: {deleted_label}"
+        if cmd == "/codex_api_list":
+            providers = session_service.list_codex_providers()
+            session = session_service.get_or_create_chat_session(chat_id)
+            current_label = "default"
+            if session["integration_mode"] == "codex_cli_session":
+                status = session_service.get_session_status(session["session_id"])
+                current_label = status.get("backend_status", {}).get("provider_label") or "default"
+            lines = [f"current_provider: {current_label}", f"providers: {len(providers)}"]
+            for item in providers:
+                marker = "*" if item["label"] == current_label else "-"
+                lines.append(
+                    f"{marker} {item['label']} | model={item['model']} | base_url={item['base_url']}"
+                )
+            return "\n".join(lines)
+        if cmd == "/claude_code_api_list":
+            providers = session_service.list_claude_code_providers()
+            session = session_service.get_or_create_chat_session(chat_id)
+            current_label = "default"
+            if session["integration_mode"] == "claude_code_cli_session":
+                status = session_service.get_session_status(session["session_id"])
+                current_label = status.get("backend_status", {}).get("provider_label") or "default"
+            lines = [f"current_provider: {current_label}", f"providers: {len(providers)}"]
+            for item in providers:
+                marker = "*" if item["label"] == current_label else "-"
+                lines.append(
+                    f"{marker} {item['label']} | model={item['model']} | base_url={item['base_url']}"
+                )
+            return "\n".join(lines)
+        if cmd == "/codex_api_switch":
+            raw = parts[1].strip() if len(parts) > 1 else ""
+            if not raw:
+                return "Usage: /codex_api_switch <label|default>"
+            try:
+                source_session = session_service.get_or_create_chat_session(chat_id)
+                source_status = session_service.get_session_status(source_session["session_id"])
+                status = session_service.switch_chat_codex_provider(chat_id, raw)
+                if source_status.get("backend_status", {}).get("context_handoff_mode", "light") == "light":
+                    handoff_text = _build_context_handoff(
+                        source_session,
+                        reason="provider_switch",
+                        target_mode="codex_cli_session",
+                        target_provider_label=raw.strip() or "default",
+                    )
+                    session_service.queue_session_context_handoff(status["session_id"], handoff_text)
+                    status = session_service.get_session_status(status["session_id"])
+            except KeyError:
+                return f"Codex provider not found: {raw}"
+            except Exception as exc:  # noqa: BLE001
+                return str(exc)
+            backend_status = status.get("backend_status", {})
+            return (
+                "Codex provider switched.\n"
+                f"provider_label: {backend_status.get('provider_label') or 'default'}\n"
+                f"provider_model: {backend_status.get('provider_model') or '(codex default)'}\n"
+                f"provider_base_url: {backend_status.get('provider_base_url') or '(official)'}\n"
+                "thread_reset: True\n"
+                f"context_handoff: {backend_status.get('context_handoff_mode')}\n"
+                f"context_queued: {'yes' if backend_status.get('pending_context_handoff') else 'no'}"
+            )
+        if cmd == "/claude_code_api_switch":
+            raw = parts[1].strip() if len(parts) > 1 else ""
+            if not raw:
+                return "Usage: /claude_code_api_switch <label|default>"
+            try:
+                source_session = session_service.get_or_create_chat_session(chat_id)
+                source_status = session_service.get_session_status(source_session["session_id"])
+                status = session_service.switch_chat_claude_code_provider(chat_id, raw)
+                if source_status.get("backend_status", {}).get("context_handoff_mode", "light") == "light":
+                    handoff_text = _build_context_handoff(
+                        source_session,
+                        reason="provider_switch",
+                        target_mode="claude_code_cli_session",
+                        target_provider_label=raw.strip() or "default",
+                    )
+                    session_service.queue_session_context_handoff(status["session_id"], handoff_text)
+                    status = session_service.get_session_status(status["session_id"])
+            except KeyError:
+                return f"Claude Code provider not found: {raw}"
+            except Exception as exc:  # noqa: BLE001
+                return str(exc)
+            backend_status = status.get("backend_status", {})
+            return (
+                "Claude Code provider switched.\n"
+                f"provider_label: {backend_status.get('provider_label') or 'default'}\n"
+                f"provider_model: {backend_status.get('provider_model') or '(empty)'}\n"
+                f"provider_base_url: {backend_status.get('provider_base_url') or '(empty)'}\n"
+                "thread_reset: True\n"
+                f"context_handoff: {backend_status.get('context_handoff_mode')}\n"
+                f"context_queued: {'yes' if backend_status.get('pending_context_handoff') else 'no'}"
+                + _provider_switch_warning("claude_code_cli_session", backend_status)
+            )
+        if cmd in {"/codex_proxy", "/claude_code_proxy"}:
+            mode = "codex_cli_session" if cmd == "/codex_proxy" else "claude_code_cli_session"
+            display = "Codex" if mode == "codex_cli_session" else "Claude Code"
+            usage = "/codex proxy <on|off>" if mode == "codex_cli_session" else "/claude proxy <on|off>"
+            raw = parts[1].strip().lower() if len(parts) > 1 else ""
+            if not raw:
+                current = _runtime_proxy_url(mode)
+                return (
+                    f"{display} proxy: {'on' if current else 'off'}\n"
+                    f"proxy_url: {current or '(disabled)'}\n"
+                    f"Usage: {usage}"
+                )
+            if raw not in {"on", "off"}:
+                return f"Usage: {usage}"
+            try:
+                current = _set_runtime_proxy(mode, raw == "on")
+            except Exception as exc:  # noqa: BLE001
+                return str(exc)
+            return (
+                f"{display} proxy {'enabled' if current else 'disabled'}.\n"
+                f"proxy_url: {current or '(disabled)'}"
+            )
         if cmd == "/status":
             session = session_service.get_chat(chat_id)
-            shell_status = shell_service.get_status(chat_id)
+            shell_status = shell_service.get_status(session["session_id"]) if session else shell_service.get_status("__missing__")
             if not session:
                 return (
-                    "No active Codex session for this chat yet.\n"
+                    "No active coder session for this chat yet.\n"
+                    f"codex_proxy: {'on' if _runtime_proxy_enabled('codex_cli_session') else 'off'}\n"
+                    f"claude_proxy: {'on' if _runtime_proxy_enabled('claude_code_cli_session') else 'off'}\n"
                     f"{_shell_status_text(shell_status)}"
                 )
             detail = session_service.get_session_status(session["session_id"])
+            provider_model_default, _ = _provider_default_values(detail["integration_mode"])
             latest_reply = conversation_history.read_latest_reply(chat_id=chat_id, session_id=session["session_id"])
             transcript_path = conversation_history.transcript_path(chat_id=chat_id, session_id=session["session_id"])
             if chat_id in app.state.active_chats:
@@ -966,6 +1629,11 @@ def build_app() -> FastAPI:
                 f"session_status: {detail['status']}\n"
                 f"reply_state: {reply_state}\n"
                 f"mode: {detail['integration_mode']}\n"
+                f"provider_label: {detail['backend_status'].get('provider_label') or 'default'}\n"
+                f"provider_model: {detail['backend_status'].get('provider_model') or provider_model_default}\n"
+                f"context_handoff: {detail['backend_status'].get('context_handoff_mode') or 'light'}\n"
+                f"codex_proxy: {'on' if _runtime_proxy_enabled('codex_cli_session') else 'off'}\n"
+                f"claude_proxy: {'on' if _runtime_proxy_enabled('claude_code_cli_session') else 'off'}\n"
                 f"workspace: {detail['workspace_path']}\n"
                 f"thread_id: {detail['backend_status'].get('thread_id')}\n"
                 f"active_pid: {detail['backend_status'].get('active_pid')}\n"
@@ -976,6 +1644,25 @@ def build_app() -> FastAPI:
                 f"transcript_path: {transcript_path}\n"
                 f"latest_reply:\n{latest_reply_preview}"
             )
+        if cmd == "/resend":
+            raw = parts[1].strip() if len(parts) > 1 else ""
+            index = 1
+            if raw:
+                try:
+                    index = int(raw)
+                except ValueError:
+                    return "Usage: /resend [n]"
+            if index < 1:
+                return "Usage: /resend [n]"
+            session = session_service.get_chat(chat_id)
+            if not session:
+                return "No active coder session for this chat yet."
+            replies = conversation_history.list_replies(chat_id=chat_id, session_id=session["session_id"])
+            if not replies:
+                return "No transcript replies available for the current session."
+            if index > len(replies):
+                return f"Only {len(replies)} reply/replies available for the current session."
+            return replies[-index]
         if cmd == "/cancel":
             result = session_service.cancel_chat_reply(chat_id)
             if result.get("ok"):
@@ -989,13 +1676,13 @@ def build_app() -> FastAPI:
             reason = result.get("reason", "unknown")
             if reason == "not_running":
                 return (
-                    "No active Codex reply is running.\n"
+                    "No active backend reply is running.\n"
                     f"session_id: {result['session_id']}\n"
                     f"mode: {result['mode']}\n"
                     f"workspace: {result['workspace']}"
                 )
             return (
-                "Unable to cancel Codex reply.\n"
+                "Unable to cancel backend reply.\n"
                 f"session_id: {result['session_id']}\n"
                 f"reason: {reason}"
             )
@@ -1117,9 +1804,16 @@ def build_app() -> FastAPI:
         if cmd == "/cmd":
             raw_command = parts[1].strip() if len(parts) > 1 else ""
             if not raw_command:
-                shell_status = shell_service.get_status(chat_id)
+                shell_status = shell_service.get_status(_shell_session()["session_id"])
                 return f"Usage: /cmd <command>\n{_shell_status_text(shell_status)}"
-            output = await asyncio.to_thread(shell_service.execute, chat_id, raw_command, command_workspace)
+            shell_session = _shell_session()
+            output = await asyncio.to_thread(
+                shell_service.execute,
+                shell_session["session_id"],
+                chat_id,
+                raw_command,
+                command_workspace,
+            )
             return output
         if cmd == "/cmd_bg":
             raw_command = parts[1].strip() if len(parts) > 1 else ""
@@ -1128,7 +1822,15 @@ def build_app() -> FastAPI:
             command_text, label = _split_with_label(raw_command)
             if not command_text:
                 return "Usage: /cmd_bg <command> [:: label]"
-            job = await asyncio.to_thread(shell_service.start_background, chat_id, command_text, command_workspace, label)
+            shell_session = _shell_session()
+            job = await asyncio.to_thread(
+                shell_service.start_background,
+                shell_session["session_id"],
+                chat_id,
+                command_text,
+                command_workspace,
+                label,
+            )
             return (
                 f"Started background job #{job['job_id']}.\n"
                 f"label: {job.get('label') or '(none)'}\n"
@@ -1137,16 +1839,81 @@ def build_app() -> FastAPI:
                 f"log_path: {job['log_path']}\n"
                 f"Use /log {job['job_id']} or /cmd_status"
             )
+        if cmd in {"/cmd_bg_all", "/cmd_job_all"}:
+            jobs = await asyncio.to_thread(shell_service.list_all_jobs)
+            if not jobs:
+                return "No shell background jobs across all sessions."
+            sessions = {
+                item["session_id"]: item
+                for item in await asyncio.to_thread(session_service.list_sessions)
+            }
+            grouped: dict[str, dict[str, object]] = {}
+            for global_index, job in enumerate(jobs, start=1):
+                bucket = grouped.setdefault(
+                    job["session_id"],
+                    {
+                        "chat_id": job["chat_id"],
+                        "session_id": job["session_id"],
+                        "label": (sessions.get(job["session_id"]) or {}).get("label", ""),
+                        "items": [],
+                    },
+                )
+                bucket["items"].append((global_index, job["job_id"]))
+
+            ordered_groups = sorted(
+                grouped.values(),
+                key=lambda item: item["items"][0][0],
+            )
+            lines = [f"jobs: {len(jobs)}", f"sessions: {len(ordered_groups)}"]
+            for group in ordered_groups:
+                label = group["label"] or "(none)"
+                lines.append("")
+                lines.append(
+                    f"chat={group['chat_id']} session={group['session_id']} label={label}"
+                )
+                for global_index, job_id in group["items"]:
+                    lines.append(f"{global_index}. #{job_id}")
+            return "\n".join(lines)
+        if cmd == "/cmd_bg_delete":
+            raw = parts[1].strip() if len(parts) > 1 else ""
+            if not raw:
+                return "Usage: /cmd_bg_delete <job_id>"
+            try:
+                job_id = int(raw.split()[0])
+            except ValueError:
+                return "Usage: /cmd_bg_delete <job_id>"
+            result = await asyncio.to_thread(shell_service.delete_job, _shell_session()["session_id"], job_id)
+            if not result["ok"]:
+                return result["error"]
+            job = result["job"]
+            return (
+                f"Deleted background job #{job['job_id']}.\n"
+                f"label: {job.get('label') or '(none)'}\n"
+                f"pid: {job['pid']}\n"
+                f"cwd: {job['cwd']}"
+            )
+        if cmd == "/cmd_bg_clear":
+            result = await asyncio.to_thread(shell_service.clear_jobs, _shell_session()["session_id"])
+            deleted = result["deleted"]
+            if not deleted:
+                return "No shell background jobs for this chat."
+            lines = [f"deleted_jobs: {len(deleted)}"]
+            for job in deleted[:20]:
+                lines.append(f"deleted #{job['job_id']} pid={job['pid']} cwd={job['cwd']}")
+            if len(deleted) > 20:
+                lines.append(f"... and {len(deleted) - 20} more")
+            return "\n".join(lines)
         if cmd == "/conda":
             raw = parts[1].strip() if len(parts) > 1 else ""
             if not raw:
-                shell_status = shell_service.get_status(chat_id)
+                shell_status = shell_service.get_status(_shell_session()["session_id"])
                 return (
                     f"conda_env: {shell_status.get('conda_env', '(default)')}\n"
                     f"shell_cwd: {shell_status.get('cwd') or command_workspace}\n"
                     "Use /conda <env>, /conda_envs, or /conda_off"
                 )
-            selected = await asyncio.to_thread(shell_service.set_conda_env, chat_id, raw)
+            shell_session = _shell_session()
+            selected = await asyncio.to_thread(shell_service.set_conda_env, shell_session["session_id"], chat_id, raw)
             return (
                 "Conda environment updated.\n"
                 f"conda_env: {selected['conda_env']}\n"
@@ -1154,7 +1921,7 @@ def build_app() -> FastAPI:
             )
         if cmd == "/conda_envs":
             envs = await asyncio.to_thread(shell_service.list_conda_envs)
-            status = shell_service.get_status(chat_id)
+            status = shell_service.get_status(_shell_session()["session_id"])
             lines = [f"selected_conda_env: {status.get('conda_env', '(default)')}"]
             for env in envs:
                 marker = "*" if env["name"] == status.get("conda_env") else ("(base)" if env["active"] == "true" else "")
@@ -1162,7 +1929,8 @@ def build_app() -> FastAPI:
                 lines.append(f"{env['name']}{suffix}: {env['path']}")
             return "\n".join(lines)
         if cmd == "/conda_off":
-            cleared = await asyncio.to_thread(shell_service.clear_conda_env, chat_id)
+            shell_session = _shell_session()
+            cleared = await asyncio.to_thread(shell_service.clear_conda_env, shell_session["session_id"], chat_id)
             return (
                 "Conda environment cleared.\n"
                 f"previous: {cleared['previous']}\n"
@@ -1175,9 +1943,9 @@ def build_app() -> FastAPI:
                     lines_value = max(1, min(int(arg), 200))
                 except ValueError:
                     lines_value = 20
-            return await asyncio.to_thread(shell_service.format_status, chat_id, lines_value)
+            return await asyncio.to_thread(shell_service.format_status, _shell_session()["session_id"], lines_value)
         if cmd == "/cmd_jobs":
-            jobs = await asyncio.to_thread(shell_service.list_jobs, chat_id)
+            jobs = await asyncio.to_thread(shell_service.list_jobs, _shell_session()["session_id"])
             if not jobs:
                 return "No shell background jobs for this chat."
             lines = [f"jobs: {len(jobs)}"]
@@ -1190,7 +1958,7 @@ def build_app() -> FastAPI:
         if cmd == "/log":
             raw = parts[1].strip() if len(parts) > 1 else ""
             job_id, lines_value = _parse_tail_and_job(raw)
-            tail = await asyncio.to_thread(shell_service.tail_logs, chat_id, job_id, lines_value)
+            tail = await asyncio.to_thread(shell_service.tail_logs, _shell_session()["session_id"], job_id, lines_value)
             if not tail["ok"]:
                 return tail["error"]
             job = tail["job"]
@@ -1209,7 +1977,13 @@ def build_app() -> FastAPI:
         if cmd == "/watch":
             raw = parts[1].strip() if len(parts) > 1 else ""
             job_id, lines_value, keywords = _parse_watch_args(raw)
-            watch = await asyncio.to_thread(shell_service.watch_logs, chat_id, job_id, lines_value, keywords or None)
+            watch = await asyncio.to_thread(
+                shell_service.watch_logs,
+                _shell_session()["session_id"],
+                job_id,
+                lines_value,
+                keywords or None,
+            )
             if not watch["ok"]:
                 return watch["error"]
             job = watch["job"]
@@ -1235,7 +2009,7 @@ def build_app() -> FastAPI:
                 job_id = int(raw.split()[0])
             except ValueError:
                 return "Usage: /cmd_stop <job_id>"
-            result = await asyncio.to_thread(shell_service.stop_job, chat_id, job_id)
+            result = await asyncio.to_thread(shell_service.stop_job, _shell_session()["session_id"], job_id)
             if not result["ok"]:
                 return result["error"]
             job = result["job"]
@@ -1253,7 +2027,7 @@ def build_app() -> FastAPI:
                 f"log_path: {job['log_path']}"
             )
         if cmd == "/cmd_stop_all":
-            result = await asyncio.to_thread(shell_service.stop_all_jobs, chat_id)
+            result = await asyncio.to_thread(shell_service.stop_all_jobs, _shell_session()["session_id"])
             stopped = result["stopped"]
             already = result["already_stopped"]
             if not stopped and not already:
@@ -1268,7 +2042,8 @@ def build_app() -> FastAPI:
                 lines.append(f"already_stopped #{job['job_id']} pid={job['pid']} exit={job['return_code']}")
             return "\n".join(lines)
         if cmd == "/cmd_reset":
-            status = await asyncio.to_thread(shell_service.reset, chat_id, command_workspace)
+            shell_session = _shell_session()
+            status = await asyncio.to_thread(shell_service.reset, shell_session["session_id"], chat_id, command_workspace)
             return (
                 "Shell reset complete.\n"
                 f"{_shell_status_text(status)}"
@@ -1278,7 +2053,10 @@ def build_app() -> FastAPI:
             return f"Workspace: {session['workspace_path']}"
         if cmd == "/mode":
             session = session_service.get_or_create_chat_session(chat_id)
-            return f"Mode: {session['integration_mode']}"
+            return (
+                f"mode: {session['integration_mode']}\n"
+                f"backend: {_mode_display_name(session['integration_mode'])}"
+            )
         if cmd == "/timeout":
             raw = parts[1].strip() if len(parts) > 1 else ""
             session = session_service.get_or_create_chat_session(chat_id)
@@ -1292,16 +2070,36 @@ def build_app() -> FastAPI:
             try:
                 value = int(raw)
             except ValueError:
-                return "Usage: /timeout <seconds>"
-            value = max(30, min(value, 3600))
+                return "Usage: /timeout <seconds|-1>"
+            if value == -1:
+                pass
+            elif value < 1:
+                return "Usage: /timeout <seconds|-1>"
             updated = session_service.set_chat_timeout(chat_id, value)
             effective = updated.get("backend_status", {}).get("timeout_seconds", value)
             return (
-                "Codex timeout updated.\n"
+                "Reply timeout updated.\n"
                 f"timeout_seconds: {effective}\n"
                 f"default_timeout_seconds: {settings.codex_message_timeout_seconds}"
             )
-        if cmd in {"/trace", "/trace_raw"}:
+        if cmd == "/context_handoff":
+            raw = parts[1].strip().lower() if len(parts) > 1 else ""
+            session = session_service.get_or_create_chat_session(chat_id)
+            status = session_service.get_session_status(session["session_id"])
+            current = status.get("backend_status", {}).get("context_handoff_mode", "light")
+            if not raw:
+                return (
+                    f"context_handoff: {current}\n"
+                    "available: off, light"
+                )
+            if raw not in {"off", "light"}:
+                return "Usage: /context_handoff <off|light>"
+            updated = session_service.set_chat_context_handoff(chat_id, raw)
+            return (
+                "Context handoff updated.\n"
+                f"context_handoff: {updated.get('backend_status', {}).get('context_handoff_mode', raw)}"
+            )
+        if cmd in {"/trace", "/trace_raw", "/trace_error"}:
             raw = parts[1].strip() if len(parts) > 1 else ""
             lines_value = 20
             if raw:
@@ -1312,9 +2110,14 @@ def build_app() -> FastAPI:
             session = session_service.get_or_create_chat_session(chat_id)
             status = session_service.get_session_status(session["session_id"])
             backend_status = status.get("backend_status", {})
-            trace_key = "recent_raw_events" if cmd == "/trace_raw" else "recent_events"
-            trace_lines = backend_status.get(trace_key, [])[-lines_value:]
             stderr_lines = backend_status.get("stderr_lines", [])[-min(lines_value, 40):]
+            if cmd == "/trace_error":
+                trace_lines = backend_status.get("recent_raw_events", [])[-lines_value:]
+                if backend_status.get("last_return_code") in {None, 0} and not stderr_lines and not trace_lines:
+                    return "No recent backend error recorded for the current session."
+            else:
+                trace_key = "recent_raw_events" if cmd == "/trace_raw" else "recent_events"
+                trace_lines = backend_status.get(trace_key, [])[-lines_value:]
             header = [
                 f"running: {backend_status.get('running')}",
                 f"thread_id: {backend_status.get('thread_id')}",
@@ -1325,6 +2128,8 @@ def build_app() -> FastAPI:
                 f"current_finished_at: {backend_status.get('current_finished_at')}",
                 f"current_prompt: {backend_status.get('current_prompt') or '(none)'}",
                 f"latest_reply_preview: {backend_status.get('latest_reply_preview') or '(none)'}",
+                f"context_handoff_mode: {backend_status.get('context_handoff_mode')}",
+                f"pending_context_handoff: {'yes' if backend_status.get('pending_context_handoff') else 'no'}",
             ]
             body = trace_lines or ["(no trace events captured yet)"]
             if stderr_lines:
@@ -1417,6 +2222,9 @@ def build_app() -> FastAPI:
         logger.info("rehydrated %d persisted chat session(s)", len(restored_sessions))
         restored_shells = await asyncio.to_thread(shell_service.restore_persisted_state)
         logger.info("rehydrated %d persisted shell session(s)", len(restored_shells))
+        proxy_started = await asyncio.to_thread(claude_proxy_service.start)
+        if proxy_started:
+            logger.info("claude code proxy enabled at %s", claude_proxy_service.public_base_url)
 
         # --- Start polling or webhook ---
         if settings.telegram_mode == "polling":
@@ -1438,6 +2246,12 @@ def build_app() -> FastAPI:
             notify_task.cancel()
             with suppress(asyncio.CancelledError):
                 await notify_task
+        restart_task = getattr(app.state, "service_restart_task", None)
+        if restart_task:
+            restart_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await restart_task
+        await asyncio.to_thread(claude_proxy_service.stop)
         shell_service.close_all()
 
     app.include_router(router)

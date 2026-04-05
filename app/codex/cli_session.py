@@ -30,6 +30,10 @@ class _SessionState:
     thread_id: str | None = None
     last_return_code: int | None = None
     timeout_seconds: int | None = None
+    provider_label: str = "default"
+    provider_model: str | None = None
+    provider_base_url: str | None = None
+    provider_api_key: str | None = None
     trace_lock: threading.Lock = field(default_factory=threading.Lock)
     running: bool = False
     current_prompt: str = ""
@@ -46,6 +50,8 @@ class _SessionState:
 
 
 class CodexCliSessionBackend(CodexBackend):
+    _CUSTOM_PROVIDER_ID = "remotecoder_custom"
+    _CUSTOM_PROVIDER_ENV_KEY = "REMOTECODER_CODEX_PROVIDER_API_KEY"
     _ENV_PASSTHROUGH_KEYS = {
         "HOME",
         "USER",
@@ -92,6 +98,14 @@ class CodexCliSessionBackend(CodexBackend):
         else:
             for key in self._PROXY_ENV_KEYS:
                 env.pop(key, None)
+        return env
+
+    def _build_session_env(self, state: _SessionState) -> dict[str, str]:
+        env = self._build_process_env()
+        if state.provider_api_key:
+            env[self._CUSTOM_PROVIDER_ENV_KEY] = state.provider_api_key
+        else:
+            env.pop(self._CUSTOM_PROVIDER_ENV_KEY, None)
         return env
 
     def _normalize_cli_args_string(self, raw_args: str) -> str:
@@ -153,8 +167,26 @@ class CodexCliSessionBackend(CodexBackend):
             timeout=timeout_seconds,
         )
 
+    def _provider_config_overrides(self, state: _SessionState) -> list[str]:
+        if state.provider_label == "default" or not state.provider_model or not state.provider_base_url:
+            return []
+        provider_label = json.dumps(state.provider_label)
+        provider_base_url = json.dumps(state.provider_base_url)
+        return [
+            "-c",
+            f'model_provider="{self._CUSTOM_PROVIDER_ID}"',
+            "-c",
+            f"model_providers.{self._CUSTOM_PROVIDER_ID}.name={provider_label}",
+            "-c",
+            f"model_providers.{self._CUSTOM_PROVIDER_ID}.base_url={provider_base_url}",
+            "-c",
+            f'model_providers.{self._CUSTOM_PROVIDER_ID}.env_key="{self._CUSTOM_PROVIDER_ENV_KEY}"',
+            "-m",
+            state.provider_model,
+        ]
+
     def _build_exec_command(self, state: _SessionState, message: str, output_path: str) -> list[str]:
-        extra = shlex.split(self.codex_args)
+        extra = [*self._provider_config_overrides(state), *shlex.split(self.codex_args)]
         if state.thread_id:
             return [*extra, "exec", "resume", "--skip-git-repo-check", "--json", "-o", output_path, state.thread_id, message]
         return [*extra, "exec", "--skip-git-repo-check", "--json", "-o", output_path, message]
@@ -294,7 +326,7 @@ class CodexCliSessionBackend(CodexBackend):
                 state.thread_id = thread_id.strip()
 
             timeout_seconds = backend_state.get("timeout_seconds")
-            if isinstance(timeout_seconds, int) and timeout_seconds > 0:
+            if isinstance(timeout_seconds, int) and (timeout_seconds > 0 or timeout_seconds == -1):
                 state.timeout_seconds = timeout_seconds
 
             last_return_code = backend_state.get("last_return_code")
@@ -321,7 +353,8 @@ class CodexCliSessionBackend(CodexBackend):
         state = self.sessions.get(session_id)
         if state is None:
             raise RuntimeError(f"Session {session_id} not found in CLI backend")
-        timeout_seconds = state.timeout_seconds or self.timeout_seconds
+        timeout_seconds = state.timeout_seconds if state.timeout_seconds is not None else self.timeout_seconds
+        wait_timeout = None if timeout_seconds == -1 else timeout_seconds
         self._mark_trace_started(state, message)
 
         output_file = tempfile.NamedTemporaryFile(prefix="codex-last-message-", suffix=".txt", delete=False)
@@ -332,7 +365,7 @@ class CodexCliSessionBackend(CodexBackend):
                 proc = subprocess.Popen(
                     cmd,
                     cwd=state.workspace,
-                    env=self._build_process_env(),
+                    env=self._build_session_env(state),
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     text=True,
@@ -354,7 +387,7 @@ class CodexCliSessionBackend(CodexBackend):
                 stdout_thread.start()
                 stderr_thread.start()
                 try:
-                    return_code = proc.wait(timeout=timeout_seconds)
+                    return_code = proc.wait(timeout=wait_timeout)
                 except subprocess.TimeoutExpired:
                     with contextlib.suppress(Exception):
                         proc.kill()
@@ -417,7 +450,10 @@ class CodexCliSessionBackend(CodexBackend):
             "workspace": str(state.workspace),
             "thread_id": state.thread_id,
             "last_return_code": state.last_return_code,
-            "timeout_seconds": state.timeout_seconds or self.timeout_seconds,
+            "timeout_seconds": state.timeout_seconds if state.timeout_seconds is not None else self.timeout_seconds,
+            "provider_label": state.provider_label,
+            "provider_model": state.provider_model,
+            "provider_base_url": state.provider_base_url,
             "running": running,
             "current_prompt": current_prompt,
             "current_started_at": current_started_at,
@@ -436,6 +472,33 @@ class CodexCliSessionBackend(CodexBackend):
         if state is None:
             raise RuntimeError(f"Session {session_id} not found in CLI backend")
         state.timeout_seconds = timeout_seconds
+        return self.get_status(session_id)
+
+    def set_session_provider(self, session_id: str, provider: dict | None) -> dict:
+        state = self.sessions.get(session_id)
+        if state is None:
+            raise RuntimeError(f"Session {session_id} not found in CLI backend")
+        with state.trace_lock:
+            state.thread_id = None
+            state.last_return_code = None
+            state.latest_reply_preview = ""
+            state.current_prompt = ""
+            state.current_started_at = None
+            state.current_finished_at = None
+            state.event_count = 0
+            state.recent_events.clear()
+            state.recent_raw_events.clear()
+            state.stderr_lines.clear()
+            if provider is None:
+                state.provider_label = "default"
+                state.provider_model = None
+                state.provider_base_url = None
+                state.provider_api_key = None
+            else:
+                state.provider_label = str(provider["label"]).strip() or "default"
+                state.provider_model = str(provider["model"]).strip()
+                state.provider_base_url = str(provider["base_url"]).strip()
+                state.provider_api_key = str(provider["api_key"]).strip()
         return self.get_status(session_id)
 
     def reset_session(self, session_id: str, workspace: Path) -> CodexSessionInfo:

@@ -5,6 +5,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.codex.cli_session import CodexCliSessionBackend
 
+WORKSPACE = Path("/tmp/project")
+
 
 class _FakeProc:
     def __init__(self, pid: int = 4321) -> None:
@@ -18,9 +20,9 @@ class _FakeProc:
         self.terminated = True
 
 
-def test_cancel_running_reply_terminates_active_process(tmp_path: Path) -> None:
+def test_cancel_running_reply_terminates_active_process() -> None:
     backend = CodexCliSessionBackend("codex", "--search", timeout_seconds=600)
-    backend.create_session("session-1", tmp_path)
+    backend.create_session("session-1", WORKSPACE)
     state = backend.sessions["session-1"]
     fake_proc = _FakeProc()
 
@@ -36,9 +38,9 @@ def test_cancel_running_reply_terminates_active_process(tmp_path: Path) -> None:
     assert fake_proc.terminated is True
 
 
-def test_cancel_running_reply_reports_not_running(tmp_path: Path) -> None:
+def test_cancel_running_reply_reports_not_running() -> None:
     backend = CodexCliSessionBackend("codex", "--search", timeout_seconds=600)
-    backend.create_session("session-1", tmp_path)
+    backend.create_session("session-1", WORKSPACE)
 
     result = backend.cancel_running_reply("session-1")
 

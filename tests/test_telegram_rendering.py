@@ -24,7 +24,7 @@ python train.py
 
     assert len(messages) == 1
     message = messages[0]
-    assert "*Codex Reply*" in message
+    assert "*Coder Reply*" in message
     assert "*项目概览*" in message
     assert "• 第一项" in message
     assert "1\\. 第二项" in message

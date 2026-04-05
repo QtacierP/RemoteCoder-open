@@ -58,15 +58,41 @@ class Database:
                     created_at TEXT NOT NULL
                 );
 
-                CREATE TABLE IF NOT EXISTS shell_sessions (
-                    chat_id INTEGER PRIMARY KEY,
+                CREATE TABLE IF NOT EXISTS app_state (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS codex_providers (
+                    label TEXT PRIMARY KEY,
+                    model TEXT NOT NULL,
+                    base_url TEXT NOT NULL,
+                    api_key TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS claude_code_providers (
+                    label TEXT PRIMARY KEY,
+                    model TEXT NOT NULL,
+                    base_url TEXT NOT NULL,
+                    api_key TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS shell_sessions_v2 (
+                    session_id TEXT PRIMARY KEY,
+                    chat_id INTEGER NOT NULL,
                     cwd TEXT NOT NULL,
                     conda_env TEXT,
                     last_exit_code INTEGER,
                     updated_at TEXT NOT NULL
                 );
 
-                CREATE TABLE IF NOT EXISTS shell_jobs (
+                CREATE TABLE IF NOT EXISTS shell_jobs_v2 (
+                    session_id TEXT NOT NULL,
                     chat_id INTEGER NOT NULL,
                     job_id INTEGER NOT NULL,
                     label TEXT NOT NULL DEFAULT '',
@@ -78,13 +104,17 @@ class Database:
                     notified_done INTEGER NOT NULL DEFAULT 0,
                     return_code INTEGER,
                     updated_at TEXT NOT NULL,
-                    PRIMARY KEY(chat_id, job_id)
+                    PRIMARY KEY(session_id, job_id)
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_sessions_chat_id ON sessions(chat_id);
                 CREATE INDEX IF NOT EXISTS idx_audit_chat_id ON audit_logs(chat_id);
                 CREATE INDEX IF NOT EXISTS idx_audit_session_id ON audit_logs(session_id);
-                CREATE INDEX IF NOT EXISTS idx_shell_jobs_chat_id ON shell_jobs(chat_id);
+                CREATE INDEX IF NOT EXISTS idx_codex_providers_updated_at ON codex_providers(updated_at);
+                CREATE INDEX IF NOT EXISTS idx_claude_code_providers_updated_at ON claude_code_providers(updated_at);
+                CREATE INDEX IF NOT EXISTS idx_shell_sessions_v2_chat_id ON shell_sessions_v2(chat_id);
+                CREATE INDEX IF NOT EXISTS idx_shell_jobs_v2_chat_id ON shell_jobs_v2(chat_id);
+                CREATE INDEX IF NOT EXISTS idx_shell_jobs_v2_session_id ON shell_jobs_v2(session_id);
                 """
             )
             columns = {row["name"] for row in conn.execute("PRAGMA table_info(sessions)").fetchall()}
@@ -160,9 +190,21 @@ class Database:
             row = conn.execute("SELECT * FROM sessions WHERE session_id = ?", (session_id,)).fetchone()
             return self._deserialize_session_row(row)
 
+    def delete_session(self, session_id: str) -> None:
+        with self.connection() as conn:
+            conn.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
+
     def list_sessions(self) -> list[dict[str, Any]]:
         with self.connection() as conn:
             rows = conn.execute("SELECT * FROM sessions ORDER BY updated_at DESC").fetchall()
+            return [item for row in rows if (item := self._deserialize_session_row(row)) is not None]
+
+    def list_chat_sessions(self, chat_id: int) -> list[dict[str, Any]]:
+        with self.connection() as conn:
+            rows = conn.execute(
+                "SELECT * FROM sessions WHERE chat_id = ? ORDER BY updated_at DESC, created_at DESC",
+                (chat_id,),
+            ).fetchall()
             return [item for row in rows if (item := self._deserialize_session_row(row)) is not None]
 
     def list_current_chat_sessions(self) -> list[dict[str, Any]]:
@@ -209,6 +251,10 @@ class Database:
                 (chat_id, session_id, self.now_iso()),
             )
 
+    def delete_chat_mapping(self, chat_id: int) -> None:
+        with self.connection() as conn:
+            conn.execute("DELETE FROM chat_session_map WHERE chat_id = ?", (chat_id,))
+
     def add_audit_log(self, event_type: str, chat_id: int | None, session_id: str | None, payload: str) -> None:
         with self.connection() as conn:
             conn.execute(
@@ -219,6 +265,32 @@ class Database:
                 (event_type, chat_id, session_id, payload, self.now_iso()),
             )
 
+    def set_app_state(self, key: str, value: Any) -> None:
+        payload = json.dumps(value, ensure_ascii=False)
+        now = self.now_iso()
+        with self.connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO app_state (key, value, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at
+                """,
+                (key, payload, now),
+            )
+
+    def get_app_state(self, key: str) -> Any | None:
+        with self.connection() as conn:
+            row = conn.execute("SELECT value FROM app_state WHERE key = ?", (key,)).fetchone()
+            if row is None:
+                return None
+            raw = row["value"]
+            if not isinstance(raw, str) or not raw.strip():
+                return None
+            try:
+                return json.loads(raw)
+            except json.JSONDecodeError:
+                return raw
+
     def recent_audit_logs(self, limit: int = 20) -> list[dict[str, Any]]:
         with self.connection() as conn:
             rows = conn.execute(
@@ -226,9 +298,72 @@ class Database:
             ).fetchall()
             return [dict(row) for row in rows]
 
+    def upsert_codex_provider(self, *, label: str, model: str, base_url: str, api_key: str) -> None:
+        now = self.now_iso()
+        with self.connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO codex_providers (label, model, base_url, api_key, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(label) DO UPDATE SET
+                    model=excluded.model,
+                    base_url=excluded.base_url,
+                    api_key=excluded.api_key,
+                    updated_at=excluded.updated_at
+                """,
+                (label, model, base_url, api_key, now, now),
+            )
+
+    def get_codex_provider(self, label: str) -> dict[str, Any] | None:
+        with self.connection() as conn:
+            row = conn.execute("SELECT * FROM codex_providers WHERE label = ?", (label,)).fetchone()
+            return dict(row) if row is not None else None
+
+    def list_codex_providers(self) -> list[dict[str, Any]]:
+        with self.connection() as conn:
+            rows = conn.execute("SELECT * FROM codex_providers ORDER BY updated_at DESC, label ASC").fetchall()
+            return [dict(row) for row in rows]
+
+    def delete_codex_provider(self, label: str) -> None:
+        with self.connection() as conn:
+            conn.execute("DELETE FROM codex_providers WHERE label = ?", (label,))
+
+    def upsert_claude_code_provider(self, *, label: str, model: str, base_url: str, api_key: str) -> None:
+        now = self.now_iso()
+        with self.connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO claude_code_providers (label, model, base_url, api_key, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(label) DO UPDATE SET
+                    model=excluded.model,
+                    base_url=excluded.base_url,
+                    api_key=excluded.api_key,
+                    updated_at=excluded.updated_at
+                """,
+                (label, model, base_url, api_key, now, now),
+            )
+
+    def get_claude_code_provider(self, label: str) -> dict[str, Any] | None:
+        with self.connection() as conn:
+            row = conn.execute("SELECT * FROM claude_code_providers WHERE label = ?", (label,)).fetchone()
+            return dict(row) if row is not None else None
+
+    def list_claude_code_providers(self) -> list[dict[str, Any]]:
+        with self.connection() as conn:
+            rows = conn.execute(
+                "SELECT * FROM claude_code_providers ORDER BY updated_at DESC, label ASC"
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def delete_claude_code_provider(self, label: str) -> None:
+        with self.connection() as conn:
+            conn.execute("DELETE FROM claude_code_providers WHERE label = ?", (label,))
+
     def upsert_shell_session(
         self,
         *,
+        session_id: str,
         chat_id: int,
         cwd: str,
         conda_env: str | None,
@@ -237,29 +372,31 @@ class Database:
         with self.connection() as conn:
             conn.execute(
                 """
-                INSERT INTO shell_sessions (chat_id, cwd, conda_env, last_exit_code, updated_at)
-                VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(chat_id) DO UPDATE SET
+                INSERT INTO shell_sessions_v2 (session_id, chat_id, cwd, conda_env, last_exit_code, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(session_id) DO UPDATE SET
+                    chat_id=excluded.chat_id,
                     cwd=excluded.cwd,
                     conda_env=excluded.conda_env,
                     last_exit_code=excluded.last_exit_code,
                     updated_at=excluded.updated_at
                 """,
-                (chat_id, cwd, conda_env, last_exit_code, self.now_iso()),
+                (session_id, chat_id, cwd, conda_env, last_exit_code, self.now_iso()),
             )
 
-    def delete_shell_session(self, chat_id: int) -> None:
+    def delete_shell_session(self, session_id: str) -> None:
         with self.connection() as conn:
-            conn.execute("DELETE FROM shell_sessions WHERE chat_id = ?", (chat_id,))
+            conn.execute("DELETE FROM shell_sessions_v2 WHERE session_id = ?", (session_id,))
 
     def list_shell_sessions(self) -> list[dict[str, Any]]:
         with self.connection() as conn:
-            rows = conn.execute("SELECT * FROM shell_sessions ORDER BY updated_at DESC").fetchall()
+            rows = conn.execute("SELECT * FROM shell_sessions_v2 ORDER BY updated_at DESC").fetchall()
             return [dict(row) for row in rows]
 
     def upsert_shell_job(
         self,
         *,
+        session_id: str,
         chat_id: int,
         job_id: int,
         label: str,
@@ -274,11 +411,12 @@ class Database:
         with self.connection() as conn:
             conn.execute(
                 """
-                INSERT INTO shell_jobs (
-                    chat_id, job_id, label, command, cwd, log_path, pid, started_at, notified_done, return_code, updated_at
+                INSERT INTO shell_jobs_v2 (
+                    session_id, chat_id, job_id, label, command, cwd, log_path, pid, started_at, notified_done, return_code, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(chat_id, job_id) DO UPDATE SET
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(session_id, job_id) DO UPDATE SET
+                    chat_id=excluded.chat_id,
                     label=excluded.label,
                     command=excluded.command,
                     cwd=excluded.cwd,
@@ -290,6 +428,7 @@ class Database:
                     updated_at=excluded.updated_at
                 """,
                 (
+                    session_id,
                     chat_id,
                     job_id,
                     label,
@@ -304,13 +443,17 @@ class Database:
                 ),
             )
 
-    def delete_shell_jobs(self, chat_id: int) -> None:
+    def delete_shell_jobs(self, session_id: str) -> None:
         with self.connection() as conn:
-            conn.execute("DELETE FROM shell_jobs WHERE chat_id = ?", (chat_id,))
+            conn.execute("DELETE FROM shell_jobs_v2 WHERE session_id = ?", (session_id,))
+
+    def delete_shell_job(self, session_id: str, job_id: int) -> None:
+        with self.connection() as conn:
+            conn.execute("DELETE FROM shell_jobs_v2 WHERE session_id = ? AND job_id = ?", (session_id, job_id))
 
     def list_shell_jobs(self) -> list[dict[str, Any]]:
         with self.connection() as conn:
-            rows = conn.execute("SELECT * FROM shell_jobs ORDER BY chat_id, job_id").fetchall()
+            rows = conn.execute("SELECT * FROM shell_jobs_v2 ORDER BY session_id, job_id").fetchall()
             records = [dict(row) for row in rows]
             for record in records:
                 record["notified_done"] = bool(record.get("notified_done"))

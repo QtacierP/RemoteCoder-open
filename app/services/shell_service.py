@@ -1,4 +1,4 @@
-"""Per-chat shell command runner with background job support."""
+"""Per-session shell command runner with background job support."""
 
 from __future__ import annotations
 
@@ -68,6 +68,8 @@ class _JobState:
 
 @dataclass
 class _ShellState:
+    session_id: str
+    chat_id: int
     cwd: Path
     conda_env: str | None = None
     busy: bool = False
@@ -108,24 +110,26 @@ class ShellService:
         self.log_root = Path(log_root or "/tmp/remotecoder_shell_jobs").resolve()
         self.log_root.mkdir(parents=True, exist_ok=True)
         self.db = db
-        self._sessions: dict[int, _ShellState] = {}
+        self._sessions: dict[str, _ShellState] = {}
         self._lock = threading.Lock()
 
-    def _persist_shell_state(self, chat_id: int, state: _ShellState) -> None:
+    def _persist_shell_state(self, state: _ShellState) -> None:
         if self.db is None:
             return
         self.db.upsert_shell_session(
-            chat_id=chat_id,
+            session_id=state.session_id,
+            chat_id=state.chat_id,
             cwd=str(state.cwd),
             conda_env=state.conda_env,
             last_exit_code=state.last_exit_code,
         )
 
-    def _persist_job_state(self, chat_id: int, job: _JobState) -> None:
+    def _persist_job_state(self, state: _ShellState, job: _JobState) -> None:
         if self.db is None:
             return
         self.db.upsert_shell_job(
-            chat_id=chat_id,
+            session_id=state.session_id,
+            chat_id=state.chat_id,
             job_id=job.job_id,
             label=job.label,
             command=job.command,
@@ -137,29 +141,36 @@ class ShellService:
             return_code=job.process.poll(),
         )
 
-    def _delete_shell_jobs(self, chat_id: int) -> None:
+    def _delete_shell_jobs(self, session_id: str) -> None:
         if self.db is None:
             return
-        self.db.delete_shell_jobs(chat_id)
+        self.db.delete_shell_jobs(session_id)
+
+    def _delete_shell_job(self, session_id: str, job_id: int) -> None:
+        if self.db is None:
+            return
+        self.db.delete_shell_job(session_id, job_id)
 
     def restore_persisted_state(self) -> list[dict]:
         if self.db is None:
             return []
 
-        sessions = {item["chat_id"]: item for item in self.db.list_shell_sessions()}
-        jobs_by_chat: dict[int, list[dict]] = {}
+        sessions = {str(item["session_id"]): item for item in self.db.list_shell_sessions()}
+        jobs_by_session: dict[str, list[dict]] = {}
         for job in self.db.list_shell_jobs():
-            jobs_by_chat.setdefault(job["chat_id"], []).append(job)
+            jobs_by_session.setdefault(str(job["session_id"]), []).append(job)
 
         restored: list[dict] = []
         with self._lock:
-            for chat_id, session in sessions.items():
+            for session_id, session in sessions.items():
                 state = _ShellState(
+                    session_id=session_id,
+                    chat_id=int(session["chat_id"]),
                     cwd=Path(session["cwd"]).resolve(),
                     conda_env=session.get("conda_env"),
                     last_exit_code=session.get("last_exit_code"),
                 )
-                for job_record in sorted(jobs_by_chat.get(chat_id, []), key=lambda item: item["job_id"]):
+                for job_record in sorted(jobs_by_session.get(session_id, []), key=lambda item: item["job_id"]):
                     handle = _PidProcessHandle(
                         pid=int(job_record["pid"]),
                         return_code=job_record.get("return_code"),
@@ -177,10 +188,11 @@ class ShellService:
                     state.jobs[job.job_id] = job
                 if state.jobs:
                     state.next_job_id = max(state.jobs) + 1
-                self._sessions[chat_id] = state
+                self._sessions[session_id] = state
                 restored.append(
                     {
-                        "chat_id": chat_id,
+                        "chat_id": state.chat_id,
+                        "session_id": session_id,
                         "cwd": str(state.cwd),
                         "jobs": len(state.jobs),
                     }
@@ -209,14 +221,14 @@ class ShellService:
             return lines, False
         return lines[:limit], True
 
-    def _get_or_create(self, chat_id: int, workspace: str | Path | None = None) -> _ShellState:
+    def _get_or_create(self, session_id: str, chat_id: int, workspace: str | Path | None = None) -> _ShellState:
         target = Path(workspace or self.default_workspace).resolve()
         with self._lock:
-            state = self._sessions.get(chat_id)
+            state = self._sessions.get(session_id)
             if state is None:
-                state = _ShellState(cwd=target)
-                self._sessions[chat_id] = state
-                self._persist_shell_state(chat_id, state)
+                state = _ShellState(session_id=session_id, chat_id=chat_id, cwd=target)
+                self._sessions[session_id] = state
+                self._persist_shell_state(state)
             return state
 
     @staticmethod
@@ -258,8 +270,8 @@ class ShellService:
             return ["stdbuf", "-oL", "-eL", "bash", "-lc", shell_script]
         return ["bash", "-lc", shell_script]
 
-    def execute(self, chat_id: int, command: str, workspace: str | Path | None = None) -> str:
-        state = self._get_or_create(chat_id, workspace)
+    def execute(self, session_id: str, chat_id: int, command: str, workspace: str | Path | None = None) -> str:
+        state = self._get_or_create(session_id, chat_id, workspace)
         with state.lock:
             state.busy = True
             try:
@@ -285,7 +297,7 @@ class ShellService:
                         continue
                     cleaned_lines.append(line)
                 state.cwd = new_cwd
-                self._persist_shell_state(chat_id, state)
+                self._persist_shell_state(state)
                 output = "\n".join(cleaned_lines).strip()
                 if output:
                     return output
@@ -324,16 +336,18 @@ class ShellService:
 
     def start_background(
         self,
+        session_id: str,
         chat_id: int,
         command: str,
         workspace: str | Path | None = None,
         label: str = "",
     ) -> dict:
-        state = self._get_or_create(chat_id, workspace)
+        state = self._get_or_create(session_id, chat_id, workspace)
         with state.lock:
             job_id = state.next_job_id
             state.next_job_id += 1
-            log_path = self.log_root / f"chat_{chat_id}_job_{job_id}.log"
+            safe_session_id = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in session_id)
+            log_path = self.log_root / f"session_{safe_session_id}_job_{job_id}.log"
             with log_path.open("w", encoding="utf-8") as log_file:
                 if label.strip():
                     log_file.write(f"[label] {label.strip()}\n")
@@ -362,8 +376,8 @@ class ShellService:
                 started_at=time.time(),
             )
             state.jobs[job_id] = job
-            self._persist_shell_state(chat_id, state)
-            self._persist_job_state(chat_id, job)
+            self._persist_shell_state(state)
+            self._persist_job_state(state, job)
             return self._job_snapshot(job)
 
     def _job_snapshot(self, job: _JobState) -> dict:
@@ -385,9 +399,9 @@ class ShellService:
         latest_id = max(state.jobs)
         return state.jobs[latest_id]
 
-    def get_status(self, chat_id: int) -> dict:
+    def get_status(self, session_id: str) -> dict:
         with self._lock:
-            state = self._sessions.get(chat_id)
+            state = self._sessions.get(session_id)
         if state is None:
             return {
                 "exists": False,
@@ -416,9 +430,9 @@ class ShellService:
                 "latest_job_id": latest_job.job_id if latest_job else None,
             }
 
-    def get_job(self, chat_id: int, job_id: int | None = None) -> dict | None:
+    def get_job(self, session_id: str, job_id: int | None = None) -> dict | None:
         with self._lock:
-            state = self._sessions.get(chat_id)
+            state = self._sessions.get(session_id)
         if state is None:
             return None
         with state.lock:
@@ -430,9 +444,9 @@ class ShellService:
                 return None
             return self._job_snapshot(job)
 
-    def list_jobs(self, chat_id: int) -> list[dict]:
+    def list_jobs(self, session_id: str) -> list[dict]:
         with self._lock:
-            state = self._sessions.get(chat_id)
+            state = self._sessions.get(session_id)
         if state is None:
             return []
         with state.lock:
@@ -445,10 +459,10 @@ class ShellService:
                 ),
             )
 
-    def tail_logs(self, chat_id: int, job_id: int | None = None, lines: int = 20) -> dict:
+    def tail_logs(self, session_id: str, job_id: int | None = None, lines: int = 20) -> dict:
         lines = max(1, min(lines, 400))
         with self._lock:
-            state = self._sessions.get(chat_id)
+            state = self._sessions.get(session_id)
         if state is None:
             return {"ok": False, "error": "No shell session for this chat yet."}
         with state.lock:
@@ -472,10 +486,10 @@ class ShellService:
                 "output": "\n".join(tail).strip(),
             }
 
-    def watch_logs(self, chat_id: int, job_id: int | None = None, lines: int = 20, keywords: list[str] | None = None) -> dict:
+    def watch_logs(self, session_id: str, job_id: int | None = None, lines: int = 20, keywords: list[str] | None = None) -> dict:
         lines = max(1, min(lines, 400))
         with self._lock:
-            state = self._sessions.get(chat_id)
+            state = self._sessions.get(session_id)
         if state is None:
             return {"ok": False, "error": "No shell session for this chat yet."}
         with state.lock:
@@ -507,9 +521,9 @@ class ShellService:
                 "output": "\n".join(tail).strip(),
             }
 
-    def stop_job(self, chat_id: int, job_id: int, force: bool = False) -> dict:
+    def stop_job(self, session_id: str, job_id: int, force: bool = False) -> dict:
         with self._lock:
-            state = self._sessions.get(chat_id)
+            state = self._sessions.get(session_id)
         if state is None:
             return {"ok": False, "error": "No shell session for this chat yet."}
         with state.lock:
@@ -518,7 +532,7 @@ class ShellService:
                 return {"ok": False, "error": f"No shell job #{job_id} found."}
             if job.process.poll() is not None:
                 snapshot = self._job_snapshot(job)
-                self._persist_job_state(chat_id, job)
+                self._persist_job_state(state, job)
                 return {"ok": True, "job": snapshot, "already_stopped": True}
 
             sig = signal.SIGKILL if force else signal.SIGTERM
@@ -534,23 +548,23 @@ class ShellService:
                 with suppress(subprocess.TimeoutExpired):
                     job.process.wait(timeout=3)
 
-        snapshot = self.get_job(chat_id, job_id)
+        snapshot = self.get_job(session_id, job_id)
         if snapshot is None:
             return {"ok": False, "error": f"No shell job #{job_id} found after stop attempt."}
         with state.lock:
             current_job = state.jobs.get(job_id)
             if current_job is not None:
-                self._persist_job_state(chat_id, current_job)
+                self._persist_job_state(state, current_job)
         return {"ok": True, "job": snapshot, "already_stopped": False}
 
-    def stop_all_jobs(self, chat_id: int, force: bool = False) -> dict:
-        jobs = self.list_jobs(chat_id)
+    def stop_all_jobs(self, session_id: str, force: bool = False) -> dict:
+        jobs = self.list_jobs(session_id)
         if not jobs:
             return {"ok": True, "stopped": [], "already_stopped": [], "missing": False}
         stopped: list[dict] = []
         already_stopped: list[dict] = []
         for job in jobs:
-            result = self.stop_job(chat_id, job["job_id"], force=force)
+            result = self.stop_job(session_id, job["job_id"], force=force)
             if not result["ok"]:
                 continue
             if result.get("already_stopped"):
@@ -559,16 +573,74 @@ class ShellService:
                 stopped.append(result["job"])
         return {"ok": True, "stopped": stopped, "already_stopped": already_stopped, "missing": False}
 
+    def delete_job(self, session_id: str, job_id: int, force: bool = False) -> dict:
+        with self._lock:
+            state = self._sessions.get(session_id)
+        if state is None:
+            return {"ok": False, "error": "No shell session for this chat yet."}
+        result = self.stop_job(session_id, job_id, force=force)
+        if not result["ok"]:
+            return result
+        with state.lock:
+            job = state.jobs.pop(job_id, None)
+        if job is None:
+            return {"ok": False, "error": f"No shell job #{job_id} found."}
+        with suppress(FileNotFoundError):
+            job.log_path.unlink()
+        self._delete_shell_job(session_id, job_id)
+        return {"ok": True, "job": self._job_snapshot(job), "already_stopped": result.get("already_stopped", False)}
+
+    def clear_jobs(self, session_id: str, force: bool = False) -> dict:
+        with self._lock:
+            state = self._sessions.get(session_id)
+        if state is None:
+            return {"ok": True, "deleted": [], "missing": False}
+        jobs = self.list_jobs(session_id)
+        if not jobs:
+            with state.lock:
+                state.next_job_id = 1
+            return {"ok": True, "deleted": [], "missing": False}
+        deleted: list[dict] = []
+        for job in list(jobs):
+            result = self.delete_job(session_id, int(job["job_id"]), force=force)
+            if result.get("ok"):
+                deleted.append(result["job"])
+        with state.lock:
+            if not state.jobs:
+                state.next_job_id = 1
+        return {"ok": True, "deleted": deleted, "missing": False}
+
     def list_chats(self) -> list[int]:
         with self._lock:
-            return sorted(self._sessions)
+            return sorted({state.chat_id for state in self._sessions.values()})
+
+    def list_all_jobs(self) -> list[dict]:
+        with self._lock:
+            items = list(self._sessions.values())
+        jobs: list[dict] = []
+        for state in items:
+            with state.lock:
+                for job_id in sorted(state.jobs):
+                    snapshot = self._job_snapshot(state.jobs[job_id])
+                    snapshot["chat_id"] = state.chat_id
+                    snapshot["session_id"] = state.session_id
+                    jobs.append(snapshot)
+        return sorted(
+            jobs,
+            key=lambda job: (
+                0 if job["running"] else 1,
+                job["chat_id"],
+                job["session_id"],
+                -job["job_id"],
+            ),
+        )
 
     def collect_finished_notifications(self, tail_lines: int = 20) -> list[dict]:
         tail_lines = max(1, min(tail_lines, 100))
         notifications: list[dict] = []
         with self._lock:
-            items = list(self._sessions.items())
-        for chat_id, state in items:
+            items = list(self._sessions.values())
+        for state in items:
             with state.lock:
                 for job_id in sorted(state.jobs):
                     job = state.jobs[job_id]
@@ -577,7 +649,7 @@ class ShellService:
                     if job.process.poll() is None:
                         continue
                     job.notified_done = True
-                    self._persist_job_state(chat_id, job)
+                    self._persist_job_state(state, job)
                     snapshot = self._job_snapshot(job)
                     text = ""
                     if job.log_path.exists():
@@ -586,7 +658,8 @@ class ShellService:
                     tail = "\n".join(all_lines[-tail_lines:]).strip()
                     notifications.append(
                         {
-                            "chat_id": chat_id,
+                            "chat_id": state.chat_id,
+                            "session_id": state.session_id,
                             "job": snapshot,
                             "line_count": len(all_lines),
                             "shown_lines": min(len(all_lines), tail_lines),
@@ -949,9 +1022,9 @@ class ShellService:
         output = self._run_git(repo_root, ["push", remote_name, branch_name], timeout=120)
         return f"repo: {repo_root}\nremote: {remote_name}\nbranch: {branch_name}\n\n{output}"
 
-    def format_status(self, chat_id: int, tail_lines: int = 20) -> str:
+    def format_status(self, session_id: str, tail_lines: int = 20) -> str:
         tail_lines = max(1, min(tail_lines, 200))
-        status = self.get_status(chat_id)
+        status = self.get_status(session_id)
         if not status["exists"]:
             return (
                 "No shell session for this chat yet.\n"
@@ -978,7 +1051,7 @@ class ShellService:
                 lines.append(f"#{job['job_id']} pid={job['pid']} {state_label}{label_part} cwd={job['cwd']}")
                 lines.append(f"cmd: {job['command']}")
 
-            tail = self.tail_logs(chat_id, status["latest_job_id"], tail_lines)
+            tail = self.tail_logs(session_id, status["latest_job_id"], tail_lines)
             if tail["ok"]:
                 lines.append("")
                 lines.append(
@@ -987,10 +1060,24 @@ class ShellService:
                 lines.append(tail["output"] or "(log is currently empty)")
         return "\n".join(lines)
 
-    def reset(self, chat_id: int, workspace: str | Path | None = None) -> dict:
+    def sync_workspace(self, session_id: str, chat_id: int, workspace: str | Path) -> dict:
+        target = Path(workspace).resolve()
+        state = self._get_or_create(session_id, chat_id, target)
+        with state.lock:
+            has_active_jobs = any(job.process.poll() is None for job in state.jobs.values())
+            if not has_active_jobs and not state.busy:
+                state.cwd = target
+                self._persist_shell_state(state)
+            return {
+                "cwd": str(state.cwd),
+                "active_jobs": sum(1 for job in state.jobs.values() if job.process.poll() is None),
+                "workspace_applied": not has_active_jobs and not state.busy,
+            }
+
+    def reset(self, session_id: str, chat_id: int, workspace: str | Path | None = None) -> dict:
         target = Path(workspace or self.default_workspace).resolve()
         with self._lock:
-            old_state = self._sessions.get(chat_id)
+            old_state = self._sessions.get(session_id)
             if old_state is not None:
                 with old_state.lock:
                     for job in old_state.jobs.values():
@@ -998,10 +1085,15 @@ class ShellService:
                             with suppress(ProcessLookupError):
                                 os.killpg(job.process.pid, signal.SIGTERM)
             conda_env = old_state.conda_env if old_state is not None else None
-            self._sessions[chat_id] = _ShellState(cwd=target, conda_env=conda_env)
-            self._persist_shell_state(chat_id, self._sessions[chat_id])
-            self._delete_shell_jobs(chat_id)
-        return self.get_status(chat_id)
+            self._sessions[session_id] = _ShellState(
+                session_id=session_id,
+                chat_id=chat_id,
+                cwd=target,
+                conda_env=conda_env,
+            )
+            self._persist_shell_state(self._sessions[session_id])
+            self._delete_shell_jobs(session_id)
+        return self.get_status(session_id)
 
     def list_conda_envs(self) -> list[dict[str, str]]:
         proc = subprocess.run(
@@ -1033,7 +1125,7 @@ class ShellService:
             )
         return envs
 
-    def set_conda_env(self, chat_id: int, env_name: str) -> dict[str, str]:
+    def set_conda_env(self, session_id: str, chat_id: int, env_name: str) -> dict[str, str]:
         requested = env_name.strip()
         if not requested:
             raise ValueError("Usage: /conda <env>")
@@ -1042,29 +1134,29 @@ class ShellService:
         if match is None:
             available = ", ".join(env["name"] for env in envs)
             raise ValueError(f"Unknown conda env '{requested}'. Available: {available}")
-        state = self._get_or_create(chat_id)
+        state = self._get_or_create(session_id, chat_id)
         with state.lock:
             state.conda_env = match["name"]
-            self._persist_shell_state(chat_id, state)
+            self._persist_shell_state(state)
             return {"conda_env": state.conda_env, "path": match["path"]}
 
-    def clear_conda_env(self, chat_id: int) -> dict[str, str]:
-        state = self._get_or_create(chat_id)
+    def clear_conda_env(self, session_id: str, chat_id: int) -> dict[str, str]:
+        state = self._get_or_create(session_id, chat_id)
         with state.lock:
             previous = state.conda_env or "(default)"
             state.conda_env = None
-            self._persist_shell_state(chat_id, state)
+            self._persist_shell_state(state)
             return {"previous": previous, "conda_env": "(default)"}
 
     def close_all(self) -> None:
         with self._lock:
-            sessions = list(self._sessions.items())
+            sessions = list(self._sessions.values())
             self._sessions.clear()
-        for chat_id, state in sessions:
+        for state in sessions:
             with state.lock:
                 for job in state.jobs.values():
                     if job.process.poll() is None:
                         with suppress(ProcessLookupError):
                             os.killpg(job.process.pid, signal.SIGTERM)
-                    self._persist_job_state(chat_id, job)
-                self._persist_shell_state(chat_id, state)
+                    self._persist_job_state(state, job)
+                self._persist_shell_state(state)

@@ -25,7 +25,7 @@ class Settings(BaseSettings):
     log_dir: Path = Field(default=Path("./logs"), alias="LOG_DIR")
     conversation_history_dir: Path = Field(default=Path("./history_conversations"), alias="CONVERSATION_HISTORY_DIR")
 
-    default_codex_mode: Literal["codex_cli_session", "codex_sdk"] = Field(
+    default_codex_mode: Literal["codex_cli_session", "codex_sdk", "claude_code_cli_session"] = Field(
         default="codex_cli_session", alias="DEFAULT_CODEX_MODE"
     )
     default_workspace: Path = Field(default=Path("/workspace"), alias="DEFAULT_WORKSPACE")
@@ -36,6 +36,19 @@ class Settings(BaseSettings):
     codex_message_timeout_seconds: int = Field(default=120, alias="CODEX_MESSAGE_TIMEOUT_SECONDS")
     codex_debug_mode: bool = Field(default=False, alias="CODEX_DEBUG_MODE")
     codex_web_search_enabled: bool = Field(default=False, alias="CODEX_WEB_SEARCH_ENABLED")
+    claude_code_bin: str = Field(default="claude", alias="CLAUDE_CODE_BIN")
+    claude_code_cli_args: str = Field(default="", alias="CLAUDE_CODE_CLI_ARGS")
+    claude_code_thinking_mode: str = Field(default="enabled", alias="CLAUDE_CODE_THINKING_MODE")
+    default_claude_code_provider_label: str = Field(default="", alias="DEFAULT_CLAUDE_CODE_PROVIDER_LABEL")
+    claude_code_proxy_url: str = Field(default="", alias="CLAUDE_CODE_PROXY_URL")
+    claude_code_proxy_enabled: bool = Field(default=False, alias="CLAUDE_CODE_PROXY_ENABLED")
+    claude_code_proxy_host: str = Field(default="127.0.0.1", alias="CLAUDE_CODE_PROXY_HOST")
+    claude_code_proxy_port: int = Field(default=18080, alias="CLAUDE_CODE_PROXY_PORT")
+    claude_code_proxy_upstream_base: str = Field(
+        default="https://ark.cn-beijing.volces.com/api/coding",
+        alias="CLAUDE_CODE_PROXY_UPSTREAM_BASE",
+    )
+    claude_code_proxy_upstream_key: str = Field(default="", alias="CLAUDE_CODE_PROXY_UPSTREAM_KEY")
     shared_proxy_url: str = Field(default="", alias="SHARED_PROXY_URL")
     shared_proxy_port: int = Field(default=0, alias="SHARED_PROXY_PORT")
     shared_proxy_scheme: str = Field(default="socks5h", alias="SHARED_PROXY_SCHEME")
@@ -69,6 +82,12 @@ class Settings(BaseSettings):
             return self.shared_proxy_url.strip()
         if self.shared_proxy_port > 0:
             return f"{self.shared_proxy_scheme}://127.0.0.1:{self.shared_proxy_port}"
+        return None
+
+    @property
+    def claude_code_effective_proxy_url(self) -> str | None:
+        if self.claude_code_proxy_url.strip():
+            return self.claude_code_proxy_url.strip()
         return None
 
 
